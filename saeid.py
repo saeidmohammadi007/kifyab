@@ -7,9 +7,9 @@ import time
 import requests
 import ccxt
 
-# --- الگوی مرجع: تک‌کندل روزانه BTC ---
-PATTERN_SYMBOL = 'BTC-USD'
-PATTERN_DATE   = '2020-10-16'
+# --- الگوی مرجع: تک‌کندل روزانه ETH ---
+PATTERN_SYMBOL = 'ETH-USD'
+PATTERN_DATE   = '2025-07-04'      # ✅ ۴ جولای ۲۰۲۵
 SHOW_N         = 10
 
 # ---------- توابع ----------
@@ -38,7 +38,7 @@ def get_lbank_futures_symbols():
     print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
     return unique_bases
 
-def get_daily_data(ticker, start='2020-01-01'):
+def get_daily_data(ticker, start='2024-01-01'):   # ✅ شروع داده به ۲۰۲۴ منتقل شد
     """داده‌ی روزانه"""
     df = yf.download(ticker, start=start, interval='1d',
                      progress=False, auto_adjust=False)
@@ -80,7 +80,7 @@ def send_telegram_message(text):
 
 # ---------- اجرای اصلی ----------
 print(f"🔍 استخراج کندل مرجع {PATTERN_SYMBOL} در تاریخ {PATTERN_DATE} (روزانه) ...")
-ref_daily = get_daily_data(PATTERN_SYMBOL, start='2020-01-01')
+ref_daily = get_daily_data(PATTERN_SYMBOL, start='2024-01-01')   # ✅
 if ref_daily is None:
     print(f"❌ خطا در دریافت داده‌های {PATTERN_SYMBOL}")
     exit()
@@ -111,7 +111,7 @@ if not symbols:
 results = []
 for sym in tqdm(symbols, desc="اسکن کندل روزانه (قبلی)"):
     try:
-        df_daily = get_daily_data(f"{sym}-USD", start='2020-01-01')
+        df_daily = get_daily_data(f"{sym}-USD", start='2024-01-01')   # ✅
         if df_daily is None or len(df_daily) < 3:   # حداقل ۳ کندل لازم است
             continue
 
