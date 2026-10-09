@@ -7,18 +7,22 @@ import time
 import requests
 import ccxt
 
-# --- الگوی مرجع: دو کندل روزانه ETH ---
+# --- الگوی مرجع: تک‌کندل روزانه ETH ---
 PATTERN_SYMBOL = 'ETH-USD'
-PATTERN_DATES  = ['2025-08-01', '2025-08-02']   # ← دو کندل متوالی
+PATTERN_DATE   = '2025-07-04'
 SHOW_N         = 10
 
 # ---------- توابع ----------
-def get_lbank_futures_symbols():
-    exchange = ccxt.lbank({'options': {'defaultType': 'future'}})
+def get_toobit_futures_symbols():
+    """دریافت تمام ارزهای پایه‌ی فیوچرز Toobit با استفاده از CCXT"""
+    exchange = ccxt.toobit({
+        'options': {'defaultType': 'swap'},
+        'enableRateLimit': True,
+    })
     try:
         markets = exchange.load_markets()
     except Exception as e:
-        print(f"❌ خطا در اتصال به LBank: {e}")
+        print(f"❌ خطا در اتصال به Toobit: {e}")
         return []
 
     base_list = []
@@ -35,7 +39,7 @@ def get_lbank_futures_symbols():
         if b not in seen:
             seen.add(b)
             unique_bases.append(b)
-    print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
+    print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز Toobit: {len(unique_bases)}")
     return unique_bases
 
 def get_daily_data(ticker, start='2024-01-01'):
@@ -49,6 +53,10 @@ def get_daily_data(ticker, start='2024-01-01'):
     return df
 
 def get_4h_data(ticker, start_date=None, end_date=None):
+    """
+    اگر start_date داده شود، داده‌ی ساعتی در همان بازه گرفته و به 4h تبدیل می‌شود.
+    در غیر این صورت 60 روز اخیر.
+    """
     try:
         if start_date:
             df = yf.download(ticker,
@@ -82,7 +90,7 @@ def get_4h_data(ticker, start_date=None, end_date=None):
     return df_4h
 
 def candle_vector(o, h, l, c):
-    """بردار ۴بعدی نرمال‌شده‌ی یک کندل نسبت به دامنه High−Low"""
+    """بردار ۴بعدی نرمال‌شده‌ی کندل نسبت به دامنه High−Low"""
     rng = float(h - l)
     if rng <= 0 or not np.isfinite(rng):
         return None
@@ -111,87 +119,74 @@ def send_telegram_message(text):
         print(f"❌ خطا در ارسال به تلگرام: {e}")
 
 # ---------- اجرای اصلی ----------
-print(f"🔍 استخراج الگوی دو‌کندلی {PATTERN_SYMBOL} برای تاریخ‌های {PATTERN_DATES} (روزانه) ...")
+print(f"🔍 استخراج کندل مرجع {PATTERN_SYMBOL} در تاریخ {PATTERN_DATE} (روزانه) ...")
 ref_daily = get_daily_data(PATTERN_SYMBOL, start='2024-01-01')
 if ref_daily is None:
     print(f"❌ خطا در دریافت داده‌های {PATTERN_SYMBOL}")
     exit()
 
-pattern_vectors = []
-pattern_candles = []
-for pdate in PATTERN_DATES:
-    tdate = pd.to_datetime(pdate).date()
-    m = ref_daily.index.date == tdate
-    if not m.any():
-        print(f"❌ کندلی برای تاریخ {pdate} یافت نشد.")
-        exit()
-    cd = ref_daily[m].iloc[0]
-    v = candle_vector(cd['open'], cd['high'], cd['low'], cd['close'])
-    if v is None:
-        print(f"❌ کندل {pdate} نامعتبر است.")
-        exit()
-    pattern_vectors.append(v)
-    pattern_candles.append((pdate, cd['open'], cd['high'], cd['low'], cd['close']))
+target_date = pd.to_datetime(PATTERN_DATE).date()
+mask = ref_daily.index.date == target_date
+if not mask.any():
+    print(f"❌ کندلی برای تاریخ {PATTERN_DATE} یافت نشد.")
+    exit()
 
-# بردار نهایی الگو = الحاق دو بردار ۴بعدی → ۸بعدی
-pattern_vec = np.concatenate(pattern_vectors)
+candle = ref_daily[mask].iloc[0]
+o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
+pattern_vec = candle_vector(o, h, l, c)
+if pattern_vec is None:
+    print("❌ کندل مرجع نامعتبر است.")
+    exit()
 
-print("📌 کندل‌های مرجع (روزانه):")
-for (pdate, o, h, l, c) in pattern_candles:
-    print(f"   {pdate} → O={o:.4f}  H={h:.4f}  L={l:.4f}  C={c:.4f}")
-print(f"📐 بردار الگو (۸بعدی): {np.round(pattern_vec, 3).tolist()}")
+print(f"📌 کندل مرجع (روزانه): O={o:.4f}  H={h:.4f}  L={l:.4f}  C={c:.4f}")
+print(f"📐 بردار الگو: O={pattern_vec[0]:.3f} | H={pattern_vec[1]:.3f} | "
+      f"L={pattern_vec[2]:.3f} | C={pattern_vec[3]:.3f}")
 
-# --- بازه‌ی دریافت داده‌ی ۴ ساعته ---
-# آخرین کندل ۴h هدف: منتهی به 20:00 روز قبل از آخرین تاریخ الگو (یعنی 2025-08-01 20:00)
-# کندل ماقبل آن: منتهی به 20:00 روز قبل‌تر (یعنی 2025-07-31 20:00)
-first_pat_dt  = pd.to_datetime(PATTERN_DATES[0])
-last_pat_dt   = pd.to_datetime(PATTERN_DATES[-1])
-scan_end_dt   = last_pat_dt                                  # انحصاری
-scan_start_dt = first_pat_dt - pd.Timedelta(days=10)         # برای اطمینان از وجود داده
+# --- بازه‌ی زمانی برای دریافت کندل ۴ ساعته‌ی «قبلی» متناظر با تاریخ الگو ---
+pattern_dt    = pd.to_datetime(PATTERN_DATE)
+scan_end_dt   = pattern_dt
+scan_start_dt = pattern_dt - pd.Timedelta(days=10)
 
 scan_start_str = scan_start_dt.strftime('%Y-%m-%d')
 scan_end_str   = scan_end_dt.strftime('%Y-%m-%d')
 
 print(f"\n🕒 بازه‌ی دریافت کندل ۴ ساعته: {scan_start_str} تا {scan_end_str}")
-print(f"🎯 هدف: دو کندل ۴ ساعته‌ی متوالی منتهی به 20:00 روز قبل از {PATTERN_DATES[-1]}")
+print(f"🎯 کندل هدف: آخرین کندل ۴ ساعته‌ی کامل‌شده قبل از {PATTERN_DATE}")
 
-print("\n📊 دریافت نمادهای فیوچرز LBank ...")
-symbols = get_lbank_futures_symbols()
+print("\n📊 دریافت نمادهای فیوچرز Toobit ...")
+symbols = get_toobit_futures_symbols()
 if not symbols:
     print("❌ هیچ نمادی برای اسکن وجود ندارد!")
     exit()
 
 results = []
-for sym in tqdm(symbols, desc="اسکن دو کندل ۴ ساعته‌ی متوالی"):
+for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
     try:
         df_4h = get_4h_data(f"{sym}-USD",
                             start_date=scan_start_str,
                             end_date=scan_end_str)
-        if df_4h is None or len(df_4h) < 2:
+        if df_4h is None or len(df_4h) < 5:
             continue
 
-        c1 = df_4h.iloc[-2]   # کندل ماقبل آخر
-        c2 = df_4h.iloc[-1]   # کندل آخر
+        prev = df_4h.iloc[-1]
 
-        v1 = candle_vector(c1['open'], c1['high'], c1['low'], c1['close'])
-        v2 = candle_vector(c2['open'], c2['high'], c2['low'], c2['close'])
-        if v1 is None or v2 is None:
+        vec = candle_vector(prev['open'], prev['high'],
+                            prev['low'],  prev['close'])
+        if vec is None:
             continue
 
-        scan_vec = np.concatenate([v1, v2])
-        dist = float(np.linalg.norm(pattern_vec - scan_vec))
+        dist = float(np.linalg.norm(pattern_vec - vec))
 
         results.append({
             'symbol':   sym,
             'dist':     dist,
-            't1':       df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
-            't2':       df_4h.index[-1].strftime('%Y-%m-%d %H:%M'),
-            'o1': float(c1['open']), 'h1': float(c1['high']),
-            'l1': float(c1['low']),  'c1': float(c1['close']),
-            'o2': float(c2['open']), 'h2': float(c2['high']),
-            'l2': float(c2['low']),  'c2': float(c2['close']),
+            'last_4h':  df_4h.index[-1].strftime('%Y-%m-%d %H:%M'),
+            'o': float(prev['open']),
+            'h': float(prev['high']),
+            'l': float(prev['low']),
+            'c': float(prev['close']),
         })
-        time.sleep(0.3)
+        time.sleep(0.1)
     except Exception:
         continue
 
@@ -199,18 +194,15 @@ if results:
     df_res = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
 
     lines = []
-    lines.append(f"🏆 <b>دو کندل ۴ ساعته‌ی متوالی مشابه دو کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATES[0]} و {PATTERN_DATES[1]})</b>\n")
-    lines.append("📌 الگو (روزانه):")
-    for (pdate, o, h, l, c) in pattern_candles:
-        lines.append(f"   {pdate} → O={o:.6g} H={h:.6g} L={l:.6g} C={c:.6g}")
-    lines.append("")
+    lines.append(f"🏆 <b>کندل‌های ۴ ساعته‌ی مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
+    lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
+    lines.append(f"🎯 کندل هدف ۴h: منتهی به 20:00 روز قبل از {PATTERN_DATE}\n")
     for _, row in df_res.iterrows():
         lines.append(
             f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
-            f"   ۴h #1 [{row['t1']}]  O={row['o1']:.6g} H={row['h1']:.6g} "
-            f"L={row['l1']:.6g} C={row['c1']:.6g}\n"
-            f"   ۴h #2 [{row['t2']}]  O={row['o2']:.6g} H={row['h2']:.6g} "
-            f"L={row['l2']:.6g} C={row['c2']:.6g}"
+            f"   زمان ۴h: {row['last_4h']} | "
+            f"O={row['o']:.6g} H={row['h']:.6g} "
+            f"L={row['l']:.6g} C={row['c']:.6g}"
         )
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     message = "\n".join(lines)
