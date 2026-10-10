@@ -1,24 +1,28 @@
 name: LBank Pattern Scanner
 
 on:
-  workflow_dispatch:      # اجرای دستی از تب Actions
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'   # هر ۶ ساعت (UTC). اگر نمی‌خواهی زمان‌بندی شود، این خط را حذف کن
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install numpy pandas yfinance requests scipy
 
       - name: Run scanner
         env:
