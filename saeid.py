@@ -24,16 +24,19 @@ SYMBOLS = [
 ]
 
 SEARCH_PERIOD_HOURLY = "730d"
-LOOKAHEAD     = 100      # کندل ۴ساعته‌ی بعدی که بررسی می‌شود
-TARGET_PCT    = 20.0     # هدف سود (درصد)
-DD_LIMIT      = 3.0      # حداکثر ریزش مجاز قبل از رسیدن به هدف (درصد)
+LOOKAHEAD    = 100              # تعداد کندل ۴ساعته‌ی بعدی
 
-K_NEIGHBORS   = 100      # تعداد همسایه‌های نزدیک که بررسی می‌شوند
-MIN_NEIGHBORS = 50       # حداقل همسایه برای اعتبار
-MIN_HIT_RATE  = 20.0     # حداقل درصد موفقیت برای گزارش
-EXCLUDE_TEMPORAL = 30    # حذف همسایه‌های زمانی نزدیک (نشتی داده)
-DEDUP_DIST    = 0.01     # آستانه‌ی حذف الگوهای تکراری در فضای ویژگی
-TOP_PATTERNS  = 25       # چند الگوی برتر گزارش شود
+# اهداف و ریزش‌ها (چند هدف × چند ریزش)
+TARGETS       = [20.0, 50.0]
+DD_THRESHOLDS = [2.0, 3.0]
+
+# KDTree
+K_NEIGHBORS      = 100
+MIN_NEIGHBORS    = 50
+MIN_HIT_RATE     = 20.0          # حداقل نرخ برای گزارش
+EXCLUDE_TEMPORAL = 30            # حذف همسایه‌ی هم‌نماد با فاصله‌ی زمانی کم
+DEDUP_DIST       = 0.01
+TOP_PATTERNS     = 25
 
 
 # ==================== توابع ====================
@@ -72,32 +75,38 @@ def candle_features(o, h, l, c, i):
     return np.array([body, upper_wick, lower_wick, total_range], dtype=float)
 
 
-def forward_outcome(o, h, l, c, i, lookahead, target_pct, dd_limit):
-    """
-    1 اگر هدف با ریزش کمتر از dd_limit خورد،
-    0 اگر هدف نخورد یا با ریزش بیشتر خورد،
-    None اگر دیتای کافی برای آینده نبود.
-    """
-    n = len(c)
-    if i + 1 + lookahead > n:
+def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
+    """تحلیل فوروارد چند-هدفی/چند-ریزشی"""
+    if entry_idx + 1 + lookahead > n:
         return None
-    entry = float(c[i])
-    if entry <= 0:
+    entry_price = float(c[entry_idx])
+    if entry_price <= 0:
         return None
-    end = i + 1 + lookahead
-    fut_h = h[i + 1:end]
-    fut_l = l[i + 1:end]
-    if len(fut_h) == 0:
+    end = entry_idx + 1 + lookahead
+    fut_c = c[entry_idx + 1:end]
+    fut_h = h[entry_idx + 1:end]
+    fut_l = l[entry_idx + 1:end]
+    if len(fut_c) == 0:
         return None
 
-    target_price = entry * (1.0 + target_pct / 100.0)
-    hits = np.where(fut_h >= target_price)[0]
-    if len(hits) == 0:
-        return 0
-    k = int(hits[0])
-    min_low = float(np.min(fut_l[:k + 1]))
-    dd = (min_low - entry) / entry * 100.0     # منفی
-    return 1 if dd >= -dd_limit else 0
+    final_price = float(fut_c[-1])
+    total_ret = (final_price - entry_price) / entry_price * 100.0
+
+    out = {'ret': total_ret}
+    for T in TARGETS:
+        target_price = entry_price * (1 + T / 100.0)
+        hits = np.where(fut_h >= target_price)[0]
+        if len(hits) == 0:
+            out[f'hit_{T}'] = False
+            for D in DD_THRESHOLDS:
+                out[f'hit_{T}_dd{D}'] = False
+        else:
+            out[f'hit_{T}'] = True
+            k = int(hits[0])
+            dd = (float(np.min(fut_l[:k + 1])) - entry_price) / entry_price * 100.0
+            for D in DD_THRESHOLDS:
+                out[f'hit_{T}_dd{D}'] = dd >= -D
+    return out
 
 
 # ==================== تلگرام ====================
@@ -132,27 +141,50 @@ def send_message(text, chunk_size=3500):
 
 
 # ==================== گزارش ====================
-def build_report(results, base_rate):
+def build_report(results, baseline, win_base, scan_stats):
     lines = []
-    lines.append("🔍 <b>اسکن الگوهای کندلی ۴ساعته</b>")
+    lines.append("🔍 <b>اسکن الگوهای کندلی ۴ساعته (KDTree)</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🎯 هدف: <b>+{TARGET_PCT:.0f}٪</b> با ریزش کمتر از "
-                 f"<b>{DD_LIMIT:.0f}٪</b>")
-    lines.append(f"📊 نرخ پایه‌ی کل (baseline): <code>{base_rate:.1f}٪</code>")
-    lines.append(f"✅ آستانه‌ی گزارش: <code>{MIN_HIT_RATE:.0f}٪</code>")
-    lines.append(f"🧮 تعداد الگوهای برتر: <code>{len(results)}</code>")
+    lines.append(f"🎯 اهداف: <code>{', '.join(f'+{T:.0f}٪' for T in TARGETS)}</code>")
+    lines.append(f"📉 ریزش‌های مجاز: "
+                 f"<code>{', '.join(f'{D:.0f}٪' for D in DD_THRESHOLDS)}</code>")
+    lines.append(f"🧮 نمونه‌ها: <code>{scan_stats['n_samples']}</code> | "
+                 f"K همسایه: <code>{K_NEIGHBORS}</code>")
+    lines.append("")
+
+    # نرخ پایه
+    lines.append("📊 <b>نرخ پایه (baseline):</b>")
+    lines.append(f"├ سوددهی کلی: <code>{win_base:.1f}٪</code>")
+    for T in TARGETS:
+        for D in DD_THRESHOLDS:
+            v = baseline[(T, D)]
+            lines.append(f"├ +{T:.0f}٪ | DD≤{D:.0f}٪: <code>{v:.1f}٪</code>")
     lines.append("")
 
     if not results:
         lines.append("❌ هیچ الگویی با نرخ موفقیت مورد نیاز پیدا نشد.")
         return "\n".join(lines)
 
+    lines.append(f"🏆 <b>الگوهای برتر (edge نسبت به پایه):</b>")
+    lines.append("")
+
     for i, r in enumerate(results, 1):
-        edge = r['rate'] - base_rate
         lines.append(f"<b>#{i} — {r['symbol']} @ {r['date']}</b>")
-        lines.append(f"   📈 نرخ موفقیت: <code>{r['rate']:.1f}٪</code> "
-                     f"({r['n_hits']} از {r['n_neighbors']})")
-        lines.append(f"   🎯 برتری نسبت به پایه: <code>{edge:+.1f}٪</code>")
+        lines.append(f"   🔎 n=<code>{r['n_neighbors']}</code> | "
+                     f"سوددهی <code>{r['win_rate']:.1f}٪</code> "
+                     f"(پایه {win_base:.1f}٪ | "
+                     f"edge <code>{r['win_rate']-win_base:+.1f}٪</code>)")
+        # جدول اهداف
+        for T in TARGETS:
+            for D in DD_THRESHOLDS:
+                hit = r[f'rate_{T}_dd{D}']
+                base = baseline[(T, D)]
+                edge = hit - base
+                lines.append(
+                    f"   ├ +{T:.0f}٪ | DD≤{D:.0f}٪: "
+                    f"<code>{hit:.1f}٪</code> "
+                    f"(edge <code>{edge:+.1f}٪</code>)"
+                )
         f = r['feat']
         lines.append(f"   🕯 بدنه <code>{f[0]*100:+.2f}٪</code> | "
                      f"سایه‌بالا <code>{f[1]*100:.2f}٪</code> | "
@@ -166,7 +198,7 @@ def build_report(results, base_rate):
 # ==================== اجرای اصلی ====================
 def main():
     log("=" * 60)
-    log("🚀 اسکن الگوهای کندلی با نرخ موفقیت بالا")
+    log("🚀 اسکن الگوهای کندلی ۴ساعته با تحلیل چند-هدفی")
     log("=" * 60)
 
     # ۱) داده‌ی ۴ ساعته
@@ -182,11 +214,11 @@ def main():
     if not dfs:
         raise RuntimeError("هیچ داده‌ای دریافت نشد.")
 
-    # ۲) ساخت دیتاست ویژگی + نتیجه
+    # ۲) ساخت دیتاست
     all_feats    = []
+    all_meta     = []          # (symbol, candle_idx)
     all_outcomes = []
-    all_meta     = []      # (symbol, candle_idx)
-    symbol_index = {}      # برای دسترسی به date
+    symbol_index = {}
 
     for sym, df in dfs.items():
         o = df['Open'].values.astype(float)
@@ -200,44 +232,50 @@ def main():
             feat = candle_features(o, h, l, c, i)
             if feat is None:
                 continue
-            outcome = forward_outcome(o, h, l, c, i,
-                                      LOOKAHEAD, TARGET_PCT, DD_LIMIT)
-            if outcome is None:
+            out = analyze_forward(i, o, h, l, c, n, LOOKAHEAD)
+            if out is None:
                 continue
             all_feats.append(feat)
-            all_outcomes.append(outcome)
             all_meta.append((sym, i))
+            all_outcomes.append(out)
 
-    feats    = np.array(all_feats, dtype=float)
-    outcomes = np.array(all_outcomes, dtype=int)
-    log(f"\n📊 کل نمونه‌ها: {len(feats)}")
-    base_rate = float(outcomes.mean() * 100.0)
-    log(f"📊 نرخ پایه‌ی موفقیت (baseline): {base_rate:.2f}٪")
-    log(f"📊 تعداد موفق‌ها: {int(outcomes.sum())} از {len(outcomes)}")
-
-    if len(feats) < MIN_NEIGHBORS * 2:
+    feats = np.array(all_feats, dtype=float)
+    n_samples = len(feats)
+    log(f"\n📊 کل نمونه‌ها: {n_samples}")
+    if n_samples < MIN_NEIGHBORS * 2:
         raise RuntimeError("نمونه‌ها برای تحلیل کافی نیستند.")
 
-    # ۳) KDTree
+    # ۳) نرخ پایه
+    win_base = sum(1 for o in all_outcomes if o['ret'] > 0) / n_samples * 100.0
+    baseline = {}
+    for T in TARGETS:
+        for D in DD_THRESHOLDS:
+            cnt = sum(1 for o in all_outcomes if o[f'hit_{T}_dd{D}'])
+            baseline[(T, D)] = cnt / n_samples * 100.0
+
+    log(f"📊 سوددهی پایه: {win_base:.2f}٪")
+    for (T, D), v in baseline.items():
+        log(f"   +{T:.0f}٪ / DD≤{D:.0f}٪: {v:.2f}٪")
+
+    # ۴) KDTree
     log("\n🌳 ساخت KDTree...")
     tree = cKDTree(feats)
-
-    k = min(K_NEIGHBORS + 1, len(feats))
+    k = min(K_NEIGHBORS + 1, n_samples)
     log(f"🔍 جستجوی {k-1} همسایه برای هر نمونه...")
     dists, idxs = tree.query(feats, k=k)
 
-    # ۴) امتیازدهی
+    # ۵) امتیازدهی
+    log("\n🎯 امتیازدهی نمونه‌ها...")
     candidates = []
-    for i in range(len(feats)):
-        sym_i, ci = all_meta[i]
-        nb_idx = idxs[i]
 
+    for i in range(n_samples):
+        sym_i, ci = all_meta[i]
         valid = []
-        for j in nb_idx:
+        for j in idxs[i]:
+            j = int(j)
             if j == i:
                 continue
             sym_j, cj = all_meta[j]
-            # حذف همسایه‌های هم‌نماد با فاصله‌ی زمانی کم (جلوگیری از نشتی)
             if sym_j == sym_i and abs(cj - ci) <= EXCLUDE_TEMPORAL:
                 continue
             valid.append(j)
@@ -245,29 +283,45 @@ def main():
         if len(valid) < MIN_NEIGHBORS:
             continue
 
-        nb_out = outcomes[valid]
-        rate = float(nb_out.mean() * 100.0)
+        nb_out = [all_outcomes[j] for j in valid]
+        n_nb = len(nb_out)
 
-        if rate >= MIN_HIT_RATE:
-            candidates.append({
-                'idx':         i,
-                'symbol':      sym_i,
-                'candle_idx':  ci,
-                'feat':        feats[i],
-                'rate':        rate,
-                'n_neighbors': len(valid),
-                'n_hits':      int(nb_out.sum()),
-            })
+        win_rate = sum(1 for o in nb_out if o['ret'] > 0) / n_nb * 100.0
 
-    log(f"\n🎯 کاندیدهای اولیه: {len(candidates)}")
+        # نرخ‌های هر ترکیب هدف/ریزش
+        rates = {}
+        for T in TARGETS:
+            for D in DD_THRESHOLDS:
+                cnt = sum(1 for o in nb_out if o[f'hit_{T}_dd{D}'])
+                rates[(T, D)] = cnt / n_nb * 100.0
+
+        # شرط گزارش: حداقل برای یکی از ترکیب‌ها نرخ بالای آستانه
+        best_rate = max(rates.values())
+        if best_rate < MIN_HIT_RATE:
+            continue
+
+        cand = {
+            'idx':         i,
+            'symbol':      sym_i,
+            'candle_idx':  ci,
+            'feat':        feats[i],
+            'win_rate':    win_rate,
+            'n_neighbors': n_nb,
+            'best_rate':   best_rate,
+        }
+        for (T, D), v in rates.items():
+            cand[f'rate_{T}_dd{D}'] = v
+        candidates.append(cand)
+
+    log(f"🎯 کاندیدهای اولیه: {len(candidates)}")
     if not candidates:
-        report = build_report([], base_rate)
+        report = build_report([], baseline, win_base,
+                              {'n_samples': n_samples})
         send_message(report)
-        log("⚠️ هیچ الگویی بالای آستانه پیدا نشد.")
         return
 
-    # ۵) حذف تکراری‌ها (نزدیک در فضای ویژگی)
-    candidates.sort(key=lambda x: -x['rate'])
+    # ۶) حذف تکراری‌ها
+    candidates.sort(key=lambda x: -x['best_rate'])
     picked = []
     for cand in candidates:
         too_similar = False
@@ -282,22 +336,22 @@ def main():
 
     log(f"🏆 الگوهای یکتای نهایی: {len(picked)}")
 
-    # ۶) افزودن تاریخ به نتیجه
+    # ۷) افزودن تاریخ
     results = []
     for r in picked:
         sym = r['symbol']
-        dt  = symbol_index[sym][r['candle_idx']]
+        dt = symbol_index[sym][r['candle_idx']]
         if getattr(dt, 'tz', None) is not None:
             dt = dt.tz_localize(None)
         r['date'] = dt.strftime('%Y-%m-%d %H:%M')
         results.append(r)
         log(f"  ✅ {sym} @ {r['date']} | "
-            f"rate={r['rate']:.1f}% | "
-            f"n={r['n_neighbors']} | "
-            f"edge={r['rate']-base_rate:+.1f}%")
+            f"win={r['win_rate']:.1f}٪ | "
+            f"best={r['best_rate']:.1f}٪ | n={r['n_neighbors']}")
 
-    # ۷) گزارش و ارسال
-    report = build_report(results, base_rate)
+    # ۸) گزارش و ارسال
+    report = build_report(results, baseline, win_base,
+                          {'n_samples': n_samples})
     plain = (report.replace("<b>", "").replace("</b>", "")
                    .replace("<code>", "").replace("</code>", ""))
     log("\n" + plain)
