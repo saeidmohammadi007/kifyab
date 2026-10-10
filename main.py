@@ -1,240 +1,523 @@
-"""
-Crypto Shooting Star Scanner — LBank + CCXT
---------------------------------------------
-- دریافت ۱۰ ارز برتر USDT از LBank با CCXT
-- تحلیل کندل‌های ۴ ساعته
-- شناسایی الگوی Shooting Star
-- بک‌تست با TP=+2% و SL=-1%
-- ارسال گزارش به تلگرام
-"""
-
 import os
-import time
-import ccxt
-import requests
-import pandas as pd
+import sys
+import traceback
+
 import numpy as np
-
-# ---------- تنظیمات ----------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-
-TOP_N       = 10
-INTERVAL    = "4h"
-LIMIT       = 500        # LBank حداکثر ۵۰۰ کندل
-TP_PERCENT  = 2.0
-SL_PERCENT  = 1.0
-MAX_HOLD    = 6
-
-# ---------- اتصال به LBank ----------
-exchange = ccxt.lbank({
-    "enableRateLimit": True,
-    "options": {"defaultType": "spot"},
-})
+import pandas as pd
+import requests
+import yfinance as yf
 
 
-# ---------- ۱. دریافت ۱۰ ارز برتر ----------
-def get_top_symbols():
-    """دریافت ۱۰ ارز برتر USDT بر اساس حجم معاملات ۲۴ ساعته از LBank."""
+def log(m):
+    print(m, flush=True)
+
+
+# ==================== تنظیمات ====================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# 🕯 نماد هدف — همه‌ی کندل‌های این نماد اسکن می‌شوند
+TARGET_SYMBOL = "API3-USD"
+
+# ─── داده‌ی کاندیدها (4h) ───
+SEARCH_PERIOD = "730d"
+INTERVAL_SRC  = "1h"
+RESAMPLE_RULE = "4h"
+PATTERN_LEN   = 1
+
+SYMBOLS = [
+    "API3-USD",
+    "BTC-USD", "ETH-USD", "LTC-USD", "XRP-USD",
+    "XMR-USD", "ZEC-USD", "DASH-USD", "ETC-USD",
+    "XLM-USD", "REP-USD",
+]
+
+# ─── بازه‌ی کاندیدها ───
+MIN_CANDIDATE_DATE = "2024-10-01"
+MAX_CANDIDATE_DATE = "2026-12-31"
+
+EXCLUDE_EXACT_TARGET_CANDLE = True
+# اگر True باشد، کاندیدها فقط قبل از کندل مرجع قرار می‌گیرند
+RESTRICT_CANDIDATES_BEFORE_TARGET = False
+
+# ─── حالت ورود ───
+ENTRY_MODE = "next_open"   # "next_open" یا "ref_close"
+
+# ─── پارامترهای جستجو ───
+LOOKAHEAD              = 42
+K_PER_SYMBOL           = 20
+TOTAL_TOP              = 100
+EXCLUDE_TEMPORAL_HOURS = 168
+
+TARGETS       = [2.0, 20.0, 50.0]
+DD_THRESHOLDS = [1.0, 2.0, 3.0]
+
+# ─── اسکن و رتبه‌بندی ───
+# معیار رتبه‌بندی: "exp_val" | "edge" | "pct_2_dd1" | "win_pct"
+RANK_BY       = "exp_val"
+TOP_N_TO_SEND = 5
+
+# حداکثر تعداد کندل مرجع برای بررسی (None = همه)
+MAX_TARGETS_TO_SCAN = None
+
+# حداقل تعداد الگوی مشابه برای معتبر بودن یک کندل مرجع
+MIN_PATTERNS = 10
+
+ONE_CANDIDATE_PER_WEEK = True
+
+
+# ==================== دریافت داده ====================
+def fetch_4h(symbol):
+    log(f"📥 دریافت 4h {symbol}")
     try:
-        exchange.load_markets()
-        tickers = exchange.fetch_tickers()
+        df = yf.download(symbol, interval=INTERVAL_SRC, period=SEARCH_PERIOD,
+                         progress=False, auto_adjust=True, timeout=60)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[["Open", "High", "Low", "Close"]].dropna()
+        if df.empty:
+            return None
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert("UTC").tz_localize(None)
+        df.index = df.index.floor("h")
+
+        df_4h = df.resample(RESAMPLE_RULE, label="left",
+                            closed="left").agg({
+            "Open":  "first",
+            "High":  "max",
+            "Low":   "min",
+            "Close": "last",
+        }).dropna()
+
+        return df_4h if not df_4h.empty else None
     except Exception as e:
-        print(f"❌ Error fetching tickers from LBank: {e}")
-        return []
-
-    usdt_pairs = []
-    for sym, t in tickers.items():
-        if not sym.endswith("/USDT"):
-            continue
-        # حذف توکن‌های اهرمی
-        if any(x in sym for x in ["UP/", "DOWN/", "BULL/", "BEAR/"]):
-            continue
-        vol = t.get("quoteVolume")
-        if vol is None or vol <= 0:
-            continue
-        usdt_pairs.append((sym, vol))
-
-    usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-    symbols = [s for s, _ in usdt_pairs[:TOP_N]]
-    print(f"✅ Top {TOP_N} symbols from LBank: {symbols}")
-    return symbols
+        log(f"❌ fetch_4h {symbol}: {e}")
+        traceback.print_exc()
+        return None
 
 
-# ---------- ۲. دریافت کندل‌های ۴ ساعته ----------
-def get_klines(symbol, interval="4h", limit=500):
-    """دریافت کندل‌های OHLCV از LBank."""
-    ohlcv = exchange.fetch_ohlcv(
-        symbol,
-        timeframe=interval,
-        limit=min(limit, 500),   # سقف LBank
-    )
-    if not ohlcv:
-        raise ValueError(f"No data for {symbol}")
-
-    df = pd.DataFrame(
-        ohlcv,
-        columns=["open_time", "open", "high", "low", "close", "volume"]
-    )
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
-    return df
-
-
-# ---------- ۳. شناسایی الگوی Shooting Star ----------
-def detect_shooting_star(df):
+# ==================== ماتریس ویژگی (برداری) ====================
+def build_feature_matrix(df, pattern_len=PATTERN_LEN):
     """
-    الگوی Shooting Star (نزولی):
-      - سایه بالایی ≥ ۲ برابر بدنه
-      - سایه پایینی ≤ ۰.۵ برابر بدنه
-      - بدنه ≤ ۳۵٪ کل دامنه
-      - در روند صعودی قبلی ظاهر شود
+    خروجی: آرایه (n, 4*pattern_len)
+    هر ردیف = [body, upper, lower, range] برای pattern_len کندل منتهی به آن ردیف
+    ردیف‌های ابتدایی که پنجره کامل ندارند NaN می‌شوند.
     """
-    body         = (df["close"] - df["open"]).abs()
-    full_range   = df["high"] - df["low"]
-    upper_shadow = df["high"] - df[["open", "close"]].max(axis=1)
-    lower_shadow = df[["open", "close"]].min(axis=1) - df["low"]
+    o = df["Open"].values.astype(float)
+    h = df["High"].values.astype(float)
+    l = df["Low"].values.astype(float)
+    c = df["Close"].values.astype(float)
 
-    safe_body  = body.replace(0, np.nan)
-    safe_range = full_range.replace(0, np.nan)
+    safe_o = np.where(o > 0, o, np.nan)
+    body  = (c - o) / safe_o
+    upper = (h - np.maximum(o, c)) / safe_o
+    lower = (np.minimum(o, c) - l) / safe_o
+    rng   = (h - l) / safe_o
 
-    body_ratio  = body / safe_range
-    upper_ratio = upper_shadow / safe_body
-    lower_ratio = lower_shadow / safe_body
+    base = np.stack([body, upper, lower, rng], axis=1)  # (n, 4)
+    n = len(base)
 
-    # روند صعودی: close کندل قبلی بالاتر از close ۵ کندل قبل‌تر
-    uptrend = df["close"].shift(1) > df["close"].shift(6)
+    if pattern_len == 1:
+        return base
 
-    pattern = (
-        (upper_ratio >= 2.0) &
-        (lower_ratio <= 0.5) &
-        (body_ratio  <= 0.35) &
-        uptrend
-    )
-    return pattern.fillna(False)
+    out = np.full((n, 4 * pattern_len), np.nan)
+    for i in range(pattern_len - 1, n):
+        out[i] = base[i - pattern_len + 1: i + 1].ravel()
+    return out
 
 
-# ---------- ۴. بک‌تست با TP/SL ----------
-def backtest(df, signal_col):
-    """بررسی می‌کند هر سیگنال اول به TP می‌رسد یا SL."""
-    wins, losses, open_trades = 0, 0, 0
-    signal_indices = df.index[df[signal_col]].tolist()
+# ==================== تحلیل فوروارد ====================
+def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
+    if ENTRY_MODE == "next_open":
+        if entry_idx + 1 >= n:
+            return None
+        entry_price = float(o[entry_idx + 1])
+        start = entry_idx + 1
+    else:
+        entry_price = float(c[entry_idx])
+        start = entry_idx + 1
 
-    for idx in signal_indices:
-        if idx + 1 >= len(df):
-            continue
+    if entry_price <= 0:
+        return None
 
-        entry_price = df.loc[idx, "close"]
-        tp_price = entry_price * (1 + TP_PERCENT / 100)
-        sl_price = entry_price * (1 - SL_PERCENT / 100)
+    end = start + lookahead
+    if end > n:
+        return None
 
-        hit_tp, hit_sl = False, False
-        for j in range(idx + 1, min(idx + 1 + MAX_HOLD, len(df))):
-            high = df.loc[j, "high"]
-            low  = df.loc[j, "low"]
+    fut_c = c[start:end]
+    fut_h = h[start:end]
+    fut_l = l[start:end]
+    if len(fut_c) == 0:
+        return None
 
-            # چک محافظه‌کارانه: اول SL
-            if low <= sl_price:
-                hit_sl = True
-                break
-            if high >= tp_price:
-                hit_tp = True
-                break
+    final_price = float(fut_c[-1])
+    total_ret = (final_price - entry_price) / entry_price * 100.0
 
-        if hit_tp:
-            wins += 1
-        elif hit_sl:
-            losses += 1
+    out = {"ret": total_ret}
+    for T in TARGETS:
+        target_price = entry_price * (1 + T / 100.0)
+        hits = np.where(fut_h >= target_price)[0]
+        if len(hits) == 0:
+            out[f"hit_{T}"] = False
+            for D in DD_THRESHOLDS:
+                out[f"hit_{T}_dd{D}"] = False
         else:
-            open_trades += 1
+            out[f"hit_{T}"] = True
+            k = int(hits[0])
+            dd = (float(np.min(fut_l[:k + 1])) - entry_price) / entry_price * 100.0
+            for D in DD_THRESHOLDS:
+                out[f"hit_{T}_dd{D}"] = dd >= -D
+    return out
 
-    total = wins + losses
-    win_rate = (wins / total * 100) if total > 0 else 0.0
-    return wins, losses, open_trades, total, win_rate
+
+# ==================== جستجوی مشابه‌ها (با کش) ====================
+def find_similar(target_feat, target_dt_actual, dfs, feats_cache):
+    candidates_all = []
+    floor_global = pd.Timestamp(MIN_CANDIDATE_DATE)
+    cap_global   = pd.Timestamp(MAX_CANDIDATE_DATE)
+
+    for sym in SYMBOLS:
+        df = dfs.get(sym)
+        if df is None:
+            continue
+
+        feats = feats_cache[sym]
+        n = len(df)
+        idx_arr = np.arange(n)
+
+        mask = (df.index >= floor_global) & (df.index < cap_global)
+
+        if RESTRICT_CANDIDATES_BEFORE_TARGET:
+            mask = mask & (df.index < target_dt_actual)
+
+        if EXCLUDE_EXACT_TARGET_CANDLE and sym == TARGET_SYMBOL:
+            mask = mask & (df.index != target_dt_actual)
+
+        mask = mask & (idx_arr >= PATTERN_LEN - 1)
+        mask = mask & (idx_arr <= n - LOOKAHEAD - 2)
+        mask = mask & ~np.isnan(feats).any(axis=1)
+
+        valid_idxs = np.where(mask)[0]
+        if len(valid_idxs) == 0:
+            continue
+
+        sub = feats[valid_idxs]
+        diffs = sub - target_feat
+        dists = np.sqrt(np.sum(diffs * diffs, axis=1))
+
+        k = min(K_PER_SYMBOL * 5, len(valid_idxs))
+        order = np.argsort(dists)[:k]
+        for oi in order:
+            cand_idx = int(valid_idxs[oi])
+            candidates_all.append({
+                "symbol": sym,
+                "idx":    cand_idx,
+                "dist":   float(dists[oi]),
+                "date":   df.index[cand_idx],
+            })
+
+    candidates_all.sort(key=lambda x: x["dist"])
+
+    unique_candidates = []
+    seen_weeks = set()
+
+    for c_ in candidates_all:
+        if ONE_CANDIDATE_PER_WEEK:
+            iso = c_["date"].isocalendar()
+            yw = (int(iso[0]), int(iso[1]))
+            if yw in seen_weeks:
+                continue
+
+        too_close = False
+        for u in unique_candidates:
+            if u["symbol"] != c_["symbol"]:
+                continue
+            dt_hours = abs((u["date"] - c_["date"]).total_seconds()) / 3600.0
+            if dt_hours < EXCLUDE_TEMPORAL_HOURS:
+                too_close = True
+                break
+        if too_close:
+            continue
+
+        unique_candidates.append(c_)
+        if ONE_CANDIDATE_PER_WEEK:
+            iso = c_["date"].isocalendar()
+            seen_weeks.add((int(iso[0]), int(iso[1])))
+
+        if len(unique_candidates) >= TOTAL_TOP:
+            break
+
+    return unique_candidates
 
 
-# ---------- ۵. ارسال به تلگرام ----------
-def send_telegram(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram credentials missing. Skipping notification.")
+# ==================== تحلیل یک کندل مرجع ====================
+def analyze_target_candle(target_idx, df_target, target_feat,
+                          dfs, feats_cache, baseline):
+    if target_feat is None or np.isnan(target_feat).any():
+        return None
+
+    target_dt = df_target.index[target_idx]
+
+    candidates = find_similar(target_feat, target_dt, dfs, feats_cache)
+    if len(candidates) < MIN_PATTERNS:
+        return None
+
+    results = []
+    for c_ in candidates:
+        sym = c_["symbol"]
+        df = dfs[sym]
+        o = df["Open"].values.astype(float)
+        h = df["High"].values.astype(float)
+        l = df["Low"].values.astype(float)
+        cc = df["Close"].values.astype(float)
+        n = len(df)
+        r = analyze_forward(c_["idx"], o, h, l, cc, n, LOOKAHEAD)
+        if r is None:
+            continue
+        r["symbol"] = sym
+        r["date"]   = c_["date"]
+        r["dist"]   = c_["dist"]
+        results.append(r)
+
+    if len(results) < MIN_PATTERNS:
+        return None
+
+    n_res = len(results)
+    wins = sum(1 for r in results if r["ret"] > 0)
+    win_pct = wins / n_res * 100.0
+
+    hit_2_dd1_list = [r for r in results if r.get("hit_2.0_dd1.0", False)]
+    pct_2_dd1 = len(hit_2_dd1_list) / n_res * 100.0
+    base_2_dd1 = baseline.get((2.0, 1.0), 0.0)
+    edge = pct_2_dd1 - base_2_dd1
+    exp_val = pct_2_dd1 * 2.0 - (100.0 - pct_2_dd1) * 1.0
+
+    hit_rates = {}
+    for T in TARGETS:
+        for D in DD_THRESHOLDS:
+            cnt = sum(1 for r in results if r.get(f"hit_{T}_dd{D}", False))
+            hit_rates[(T, D)] = cnt / n_res * 100.0
+
+    target_info = {
+        "date": target_dt,
+        "o": float(df_target["Open"].values[target_idx]),
+        "h": float(df_target["High"].values[target_idx]),
+        "l": float(df_target["Low"].values[target_idx]),
+        "c": float(df_target["Close"].values[target_idx]),
+        "body": float(target_feat[0]),
+        "up":   float(target_feat[1]) if target_feat.size > 1 else 0.0,
+        "dn":   float(target_feat[2]) if target_feat.size > 2 else 0.0,
+        "rng":  float(target_feat[3]) if target_feat.size > 3 else 0.0,
+    }
+
+    return {
+        "target_idx":     target_idx,
+        "target_info":    target_info,
+        "n_patterns":     n_res,
+        "win_pct":        win_pct,
+        "pct_2_dd1":      pct_2_dd1,
+        "edge":           edge,
+        "exp_val":        exp_val,
+        "hit_rates":      hit_rates,
+        "hit_2_dd1_list": hit_2_dd1_list,
+    }
+
+
+# ==================== تلگرام ====================
+def send_message(text, chunk_size=3500):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        log("⚠️ توکن یا chat_id موجود نیست.")
         return
+    lines = text.split("\n")
+    chunks, cur = [], ""
+    for ln in lines:
+        if len(cur) + len(ln) + 1 > chunk_size and cur:
+            chunks.append(cur)
+            cur = ln
+        else:
+            cur = (cur + "\n" + ln) if cur else ln
+    if cur:
+        chunks.append(cur)
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    max_len = 4000
-    chunks = [message[i:i + max_len] for i in range(0, len(message), max_len)]
-
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks, 1):
         try:
             r = requests.post(
-                url,
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": chunk,
-                    "parse_mode": "Markdown",
-                },
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk,
+                      "parse_mode": "HTML"},
                 timeout=30,
             )
-            r.raise_for_status()
-            print("✅ Telegram message sent.")
+            log(f"📤 telegram part {i}/{len(chunks)}: {r.status_code}")
+            if r.status_code != 200:
+                log(f"   err: {r.text[:200]}")
         except Exception as e:
-            print(f"❌ Telegram send failed: {e}")
-        time.sleep(1)
+            log(f"❌ send part {i}: {e}")
 
 
-# ---------- ۶. اجرای اصلی ----------
+# ==================== گزارش ====================
+def build_top_report(top_results, baseline, total_scanned, total_valid):
+    if not top_results:
+        return "بدون داده"
+
+    lines = []
+    lines.append(f"🏆 <b>۵ کندل برتر {TARGET_SYMBOL} (4h)</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📅 اسکن شده: <code>{total_scanned}</code> کندل | "
+                 f"معتبر: <code>{total_valid}</code>")
+    lines.append(f"📊 معیار رتبه‌بندی: <code>{RANK_BY}</code>")
+    lines.append(f"🎯 نرخ پایه +۲٪/DD≤۱٪: "
+                 f"<code>{baseline.get((2.0, 1.0), 0.0):.1f}٪</code>")
+    lines.append(f"🔎 Lookahead: <code>{LOOKAHEAD}×4h</code> | "
+                 f"ورود: <code>{ENTRY_MODE}</code>")
+    lines.append("")
+
+    for rank, r in enumerate(top_results, 1):
+        ti = r["target_info"]
+        d = ti["date"]
+        date_s = d.strftime("%Y-%m-%d %H:%M (%a)")
+        lines.append(f"<b>#{rank} — {date_s}</b>")
+        lines.append(f"   O=<code>{ti['o']:.4f}</code> "
+                     f"H=<code>{ti['h']:.4f}</code> "
+                     f"L=<code>{ti['l']:.4f}</code> "
+                     f"C=<code>{ti['c']:.4f}</code>")
+        lines.append(f"   بدنه <code>{ti['body']*100:+.2f}٪</code> | "
+                     f"بالا <code>{ti['up']*100:.2f}٪</code> | "
+                     f"پایین <code>{ti['dn']*100:.2f}٪</code> | "
+                     f"دامنه <code>{ti['rng']*100:.2f}٪</code>")
+        lines.append(f"   الگو: <code>{r['n_patterns']}</code> | "
+                     f"سوددهی: <code>{r['win_pct']:.1f}٪</code>")
+        lines.append(f"   🎯 +۲٪/DD≤۱٪: <code>{r['pct_2_dd1']:.1f}٪</code> "
+                     f"(edge <code>{r['edge']:+.1f}٪</code>) | "
+                     f"امید <code>{r['exp_val']:+.1f}٪</code>")
+        hr = r["hit_rates"]
+        lines.append(f"   +۲۰٪/DD≤۲٪: <code>{hr.get((20.0,2.0),0):.1f}٪</code> | "
+                     f"+۵۰٪/DD≤۳٪: <code>{hr.get((50.0,3.0),0):.1f}٪</code>")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+# ==================== اجرای اصلی ====================
 def main():
-    print("🚀 Starting LBank scanner...")
-    symbols = get_top_symbols()
-    if not symbols:
-        send_telegram("⚠️ دریافت لیست ارزها از LBank ناموفق بود.")
-        return
+    log("=" * 60)
+    log(f"🚀 اسکن همه‌ی کندل‌های 4h {TARGET_SYMBOL} | ورود={ENTRY_MODE}")
+    log(f"   بازه‌ی دریافت: {SEARCH_PERIOD} | اینتروال خام: {INTERVAL_SRC}")
+    log(f"   بازه‌ی کاندیدها: {MIN_CANDIDATE_DATE} → {MAX_CANDIDATE_DATE}")
+    log(f"   TOP_N={TOP_N_TO_SEND} | RANK_BY={RANK_BY} | "
+        f"MAX_SCAN={MAX_TARGETS_TO_SCAN}")
+    log("=" * 60)
 
-    report_lines = ["📊 *گزارش اسکن Shooting Star — LBank ۴ ساعته*\n"]
-    all_wins = all_losses = all_total = 0
+    if pd.Timestamp(MIN_CANDIDATE_DATE) >= pd.Timestamp(MAX_CANDIDATE_DATE):
+        raise RuntimeError("⛔ بازه‌ی کاندید نامعتبر است.")
 
-    for sym in symbols:
+    # ۱) دریافت داده
+    dfs = {}
+    for sym in SYMBOLS:
+        df = fetch_4h(sym)
+        if df is not None and len(df) > LOOKAHEAD + 10:
+            dfs[sym] = df
+            log(f"   ↳ {sym}: {len(df)} کندل 4h "
+                f"({df.index[0]} → {df.index[-1]})")
+
+    if TARGET_SYMBOL not in dfs:
+        raise RuntimeError(f"⛔ داده‌ی 4h برای {TARGET_SYMBOL} موجود نیست.")
+
+    # ۲) کش ویژگی‌ها
+    log("\n🧮 ساخت ماتریس ویژگی‌ها...")
+    feats_cache = {}
+    for sym, df in dfs.items():
+        feats_cache[sym] = build_feature_matrix(df, PATTERN_LEN)
+        log(f"   ↳ {sym}: features {feats_cache[sym].shape}")
+
+    # ۳) نرخ پایه
+    log("\n📊 محاسبه‌ی نرخ پایه (4h)...")
+    all_outcomes = []
+    for sym, df in dfs.items():
+        o = df["Open"].values.astype(float)
+        h = df["High"].values.astype(float)
+        l = df["Low"].values.astype(float)
+        c = df["Close"].values.astype(float)
+        n = len(df)
+        for i in range(n):
+            out = analyze_forward(i, o, h, l, c, n, LOOKAHEAD)
+            if out is not None:
+                all_outcomes.append(out)
+
+    n_base = len(all_outcomes)
+    if n_base == 0:
+        raise RuntimeError("نمونه‌ی پایه صفر است.")
+    baseline = {
+        "win": sum(1 for o in all_outcomes if o["ret"] > 0) / n_base * 100.0
+    }
+    for T in TARGETS:
+        for D in DD_THRESHOLDS:
+            cnt = sum(1 for o in all_outcomes if o[f"hit_{T}_dd{D}"])
+            baseline[(T, D)] = cnt / n_base * 100.0
+
+    log(f"   نمونه: {n_base} | سوددهی پایه: {baseline['win']:.2f}٪")
+    log(f"   +۲٪/DD≤۱٪ پایه: {baseline[(2.0, 1.0)]:.2f}٪")
+
+    # ۴) اسکن همه‌ی کندل‌های TARGET_SYMBOL (از جدید به قدیم)
+    df_target    = dfs[TARGET_SYMBOL]
+    target_feats = feats_cache[TARGET_SYMBOL]
+    n_t          = len(df_target)
+
+    valid_target_idxs = list(range(PATTERN_LEN - 1, n_t))[::-1]
+    valid_target_idxs = [i for i in valid_target_idxs
+                         if not np.isnan(target_feats[i]).any()]
+
+    if MAX_TARGETS_TO_SCAN is not None:
+        valid_target_idxs = valid_target_idxs[:MAX_TARGETS_TO_SCAN]
+
+    total_targets = len(valid_target_idxs)
+    log(f"\n🔍 اسکن {total_targets} کندل مرجع از {TARGET_SYMBOL}...")
+
+    all_results = []
+    for k, idx in enumerate(valid_target_idxs):
         try:
-            df = get_klines(sym, INTERVAL, LIMIT)
-            df["signal"] = detect_shooting_star(df)
-
-            wins, losses, opens, total, win_rate = backtest(df, "signal")
-            all_wins   += wins
-            all_losses += losses
-            all_total  += total
-
-            signals_count = int(df["signal"].sum())
-            line = (
-                f"`{sym}`\n"
-                f"  سیگنال: {signals_count} | "
-                f"برد: {wins} | باخت: {losses} | "
-                f"باز: {opens} | نرخ برد: {win_rate:.1f}%\n"
+            res = analyze_target_candle(
+                idx, df_target, target_feats[idx],
+                dfs, feats_cache, baseline
             )
-            report_lines.append(line)
-            print(line.replace("\n", " "))
-
-            time.sleep(0.5)
-
+            if res:
+                all_results.append(res)
         except Exception as e:
-            err = str(e)[:80]
-            report_lines.append(f"`{sym}` → ❌ خطا: {err}\n")
-            print(f"❌ {sym}: {e}")
+            log(f"   ⚠️ خطا idx={idx}: {e}")
 
-    overall_rate = (all_wins / all_total * 100) if all_total > 0 else 0.0
-    summary = (
-        f"\n📈 *خلاصه کل:*\n"
-        f"• معاملات بسته‌شده: {all_total}\n"
-        f"• برد: {all_wins} | باخت: {all_losses}\n"
-        f"• *نرخ برد کلی: {overall_rate:.1f}%*\n"
-        f"\n⚙️ TP=+{TP_PERCENT}% | SL=-{SL_PERCENT}% | نگه‌داری: {MAX_HOLD} کندل"
-    )
-    report_lines.append(summary)
+        if (k + 1) % 100 == 0:
+            log(f"   پیشرفت: {k+1}/{total_targets} | "
+                f"معتبر: {len(all_results)}")
 
-    full_report = "\n".join(report_lines)
-    print("\n" + "=" * 50)
-    print(full_report)
-    send_telegram(full_report)
+    log(f"✅ تحلیل کامل شد: {len(all_results)} کندل معتبر")
+
+    if not all_results:
+        raise RuntimeError("هیچ کندل معتبری یافت نشد.")
+
+    # ۵) رتبه‌بندی
+    if RANK_BY not in ("exp_val", "edge", "pct_2_dd1", "win_pct"):
+        raise RuntimeError(f"RANK_BY نامعتبر: {RANK_BY}")
+
+    all_results.sort(key=lambda x: x[RANK_BY], reverse=True)
+    top5 = all_results[:TOP_N_TO_SEND]
+
+    # ۶) گزارش و ارسال
+    report = build_top_report(top5, baseline, total_targets, len(all_results))
+    plain = (report.replace("<b>", "").replace("</b>", "")
+                   .replace("<code>", "").replace("</code>", ""))
+    log("\n" + plain)
+
+    send_message(report)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log(f"❌ خطا: {e}")
+        traceback.print_exc()
+        sys.exit(1)
