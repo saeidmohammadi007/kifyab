@@ -36,9 +36,18 @@ EXCLUDE_TEMPORAL = 4
 DEDUP_DIST       = 0.01
 TOP_PATTERNS     = 25
 
-# شروع هفته: "MON" = دوشنبه→یکشنبه (استاندارد TradingView برای کریپتو)
-#             "SUN" = یکشنبه→شنبه
 WEEK_START = "MON"
+
+# ⚠️ حالت ورود:
+#   "next_open" → ورود روی Open کندل هفته‌ی بعد (واقع‌گرایانه) ✅
+#   "ref_close" → ورود روی Close کندل الگو (خوش‌بینانه، کد قبلی)
+ENTRY_MODE = "next_open"
+
+# ⚠️ کف تاریخی نمونه‌ها — yfinance قبل از این تاریخ سایه‌های کریپتو را ناقص می‌دهد
+MIN_SAMPLE_DATE = "2019-01-01"
+
+# ⚠️ اگر True باشد، برای هر کاندید منتخب، مقدار Low واقعی در پنجره‌ی lookahead چاپ می‌شود
+DEBUG_LOWS = True
 
 
 # ==================== توابع ====================
@@ -55,22 +64,13 @@ def fetch_weekly(symbol):
         if df.empty:
             return None
 
-        # اطمینان از DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
-
-        # نرمال‌سازی timezone و زمان (همه در نیمه‌شب، naive)
         if df.index.tz is not None:
             df.index = df.index.tz_convert('UTC').tz_localize(None)
         df.index = df.index.normalize()
 
-        # 🔑 anchor درست برای هم‌راستایی با TradingView
-        # W-MON با label='left' → باکت = [دوشنبه، یکشنبه] و برچسب = دوشنبه
-        # W-SUN با label='left' → باکت = [یکشنبه، شنبه] و برچسب = یکشنبه
-        if WEEK_START == "MON":
-            rule = 'W-MON'
-        else:
-            rule = 'W-SUN'
+        rule = 'W-MON' if WEEK_START == "MON" else 'W-SUN'
 
         df_wk = df.resample(rule, label='left', closed='left').agg({
             'Open':  'first',
@@ -87,7 +87,6 @@ def fetch_weekly(symbol):
 
 
 def verify_weekly_alignment(df, symbol):
-    """نمایش نمونه برای بررسی هم‌راستایی با TradingView"""
     if df is None or df.empty:
         return
     wd = set(d.weekday() for d in df.index)
@@ -96,7 +95,6 @@ def verify_weekly_alignment(df, symbol):
     log(f"   🔎 {symbol}: {len(df)} کندل | "
         f"{df.index[0].date()} → {df.index[-1].date()} | "
         f"weekdays={wd_str}")
-    # نمایش ۲ کندل اول برای تست دستی
     for dt, row in df.head(2).iterrows():
         log(f"      {dt.date()} ({names[dt.weekday()]}) | "
             f"O={row['Open']:.6f} H={row['High']:.6f} "
@@ -115,22 +113,38 @@ def candle_features(o, h, l, c, i):
 
 
 def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
-    if entry_idx + 1 + lookahead > n:
-        return None
-    entry_price = float(c[entry_idx])
+    """
+    entry_idx: ایندکس کندل الگو.
+    ورود طبق ENTRY_MODE، پنجره‌ی lookahead از کندل بعدی شروع می‌شود.
+    """
+    if ENTRY_MODE == "next_open":
+        if entry_idx + 1 >= n:
+            return None
+        entry_price = float(o[entry_idx + 1])
+        start = entry_idx + 1
+    else:  # ref_close
+        entry_price = float(c[entry_idx])
+        start = entry_idx + 1
+
     if entry_price <= 0:
         return None
-    end = entry_idx + 1 + lookahead
-    fut_c = c[entry_idx + 1:end]
-    fut_h = h[entry_idx + 1:end]
-    fut_l = l[entry_idx + 1:end]
+
+    end = start + lookahead
+    if end > n:
+        return None
+
+    fut_c = c[start:end]
+    fut_h = h[start:end]
+    fut_l = l[start:end]
     if len(fut_c) == 0:
         return None
 
     final_price = float(fut_c[-1])
     total_ret = (final_price - entry_price) / entry_price * 100.0
 
-    out = {'ret': total_ret}
+    out = {'ret': total_ret,
+           'entry_price': entry_price,
+           'min_low_window': float(np.min(fut_l))}
     for T in TARGETS:
         target_price = entry_price * (1 + T / 100.0)
         hits = np.where(fut_h >= target_price)[0]
@@ -190,6 +204,8 @@ def build_report(results, baseline, win_base, scan_stats):
                  f"<code>{', '.join(f'{D:.0f}٪' for D in DD_THRESHOLDS)}</code>")
     lines.append(f"🧮 نمونه‌ها: <code>{scan_stats['n_samples']}</code> | "
                  f"K همسایه: <code>{K_NEIGHBORS}</code>")
+    lines.append(f"📡 حالت ورود: <code>{ENTRY_MODE}</code> | "
+                 f"کف نمونه: <code>{MIN_SAMPLE_DATE}</code>")
     lines.append("")
 
     lines.append("📊 <b>نرخ پایه (baseline):</b>")
@@ -237,6 +253,7 @@ def build_report(results, baseline, win_base, scan_stats):
 def main():
     log("=" * 60)
     log("🚀 اسکن الگوهای کندلی هفتگی با تحلیل چند-هدفی")
+    log(f"   حالت ورود: {ENTRY_MODE} | کف نمونه: {MIN_SAMPLE_DATE}")
     log("=" * 60)
 
     dfs = {}
@@ -259,6 +276,8 @@ def main():
     all_outcomes = []
     symbol_index = {}
 
+    min_dt = pd.Timestamp(MIN_SAMPLE_DATE)
+
     for sym, df in dfs.items():
         o = df['Open'].values.astype(float)
         h = df['High'].values.astype(float)
@@ -267,7 +286,13 @@ def main():
         symbol_index[sym] = df.index
         n = len(df)
 
+        n_skipped_by_date = 0
         for i in range(n):
+            # ⚠️ فیلتر کف تاریخی
+            if df.index[i] < min_dt:
+                n_skipped_by_date += 1
+                continue
+
             feat = candle_features(o, h, l, c, i)
             if feat is None:
                 continue
@@ -278,9 +303,13 @@ def main():
             all_meta.append((sym, i))
             all_outcomes.append(out)
 
+        if n_skipped_by_date > 0:
+            log(f"   ⏭️  {sym}: {n_skipped_by_date} کندل قبل از "
+                f"{MIN_SAMPLE_DATE} رد شد")
+
     feats = np.array(all_feats, dtype=float)
     n_samples = len(feats)
-    log(f"\n📊 کل نمونه‌ها: {n_samples}")
+    log(f"\n📊 کل نمونه‌ها بعد از فیلتر تاریخی: {n_samples}")
     if n_samples < MIN_NEIGHBORS * 2:
         raise RuntimeError("نمونه‌ها برای تحلیل کافی نیستند.")
 
@@ -380,6 +409,28 @@ def main():
         log(f"  ✅ {sym} @ {r['date']} | "
             f"win={r['win_rate']:.1f}٪ | "
             f"best={r['best_rate']:.1f}٪ | n={r['n_neighbors']}")
+
+    # ⚠️ دیباگ: برای ۵ کاندید اول، مقدار ورود و کمترین Low چاپ شود
+    if DEBUG_LOWS:
+        log("\n🔬 دیباگ مقدار ورود و Low (برای تأیید در TradingView):")
+        for r in picked[:5]:
+            sym = r['symbol']
+            i = r['candle_idx']
+            df = dfs[sym]
+            o = df['Open'].values.astype(float)
+            c = df['Close'].values.astype(float)
+            if ENTRY_MODE == "next_open":
+                entry = o[i + 1] if i + 1 < len(o) else None
+            else:
+                entry = c[i]
+            # Low ۲۶ هفته بعد
+            fut_l = df['Low'].values.astype(float)[i + 1:i + 1 + LOOKAHEAD]
+            if len(fut_l) > 0 and entry is not None:
+                min_low = fut_l.min()
+                dd = (min_low - entry) / entry * 100.0
+                log(f"   {sym} @ {r['date']} | "
+                    f"Entry={entry:.6f} MinLow={min_low:.6f} "
+                    f"DD={dd:+.2f}٪")
 
     report = build_report(results, baseline, win_base,
                           {'n_samples': n_samples})
