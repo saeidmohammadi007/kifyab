@@ -1,7 +1,7 @@
 """
-Crypto Shooting Star Scanner
------------------------------
-- دریافت ۱۰ ارز برتر USDT از Binance با CCXT
+Crypto Shooting Star Scanner — LBank + CCXT
+--------------------------------------------
+- دریافت ۱۰ ارز برتر USDT از LBank با CCXT
 - تحلیل کندل‌های ۴ ساعته
 - شناسایی الگوی Shooting Star
 - بک‌تست با TP=+2% و SL=-1%
@@ -19,15 +19,15 @@ import numpy as np
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-TOP_N       = 10        # تعداد ارزهای برتر
-INTERVAL    = "4h"      # تایم فریم
-LIMIT       = 500       # تعداد کندل برای تحلیل
-TP_PERCENT  = 2.0       # هدف سود +۲٪
-SL_PERCENT  = 1.0       # حد ضرر -۱٪
-MAX_HOLD    = 6         # حداکثر کندل نگه‌داری برای رسیدن به TP/SL
+TOP_N       = 10
+INTERVAL    = "4h"
+LIMIT       = 500        # LBank حداکثر ۵۰۰ کندل
+TP_PERCENT  = 2.0
+SL_PERCENT  = 1.0
+MAX_HOLD    = 6
 
-# ---------- اتصال به صرافی ----------
-exchange = ccxt.binance({
+# ---------- اتصال به LBank ----------
+exchange = ccxt.lbank({
     "enableRateLimit": True,
     "options": {"defaultType": "spot"},
 })
@@ -35,11 +35,12 @@ exchange = ccxt.binance({
 
 # ---------- ۱. دریافت ۱۰ ارز برتر ----------
 def get_top_symbols():
-    """دریافت ۱۰ ارز برتر بر اساس حجم ۲۴ ساعته."""
+    """دریافت ۱۰ ارز برتر USDT بر اساس حجم معاملات ۲۴ ساعته از LBank."""
     try:
+        exchange.load_markets()
         tickers = exchange.fetch_tickers()
     except Exception as e:
-        print(f"❌ Error fetching tickers: {e}")
+        print(f"❌ Error fetching tickers from LBank: {e}")
         return []
 
     usdt_pairs = []
@@ -56,14 +57,18 @@ def get_top_symbols():
 
     usdt_pairs.sort(key=lambda x: x[1], reverse=True)
     symbols = [s for s, _ in usdt_pairs[:TOP_N]]
-    print(f"✅ Top {TOP_N} symbols: {symbols}")
+    print(f"✅ Top {TOP_N} symbols from LBank: {symbols}")
     return symbols
 
 
 # ---------- ۲. دریافت کندل‌های ۴ ساعته ----------
 def get_klines(symbol, interval="4h", limit=500):
-    """دریافت کندل‌های OHLCV از Binance با CCXT."""
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
+    """دریافت کندل‌های OHLCV از LBank."""
+    ohlcv = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=interval,
+        limit=min(limit, 500),   # سقف LBank
+    )
     if not ohlcv:
         raise ValueError(f"No data for {symbol}")
 
@@ -74,7 +79,6 @@ def get_klines(symbol, interval="4h", limit=500):
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
-
     return df
 
 
@@ -92,7 +96,6 @@ def detect_shooting_star(df):
     upper_shadow = df["high"] - df[["open", "close"]].max(axis=1)
     lower_shadow = df[["open", "close"]].min(axis=1) - df["low"]
 
-    # جلوگیری از تقسیم بر صفر
     safe_body  = body.replace(0, np.nan)
     safe_range = full_range.replace(0, np.nan)
 
@@ -131,7 +134,7 @@ def backtest(df, signal_col):
             high = df.loc[j, "high"]
             low  = df.loc[j, "low"]
 
-            # چک SL اول (محافظه‌کارانه)
+            # چک محافظه‌کارانه: اول SL
             if low <= sl_price:
                 hit_sl = True
                 break
@@ -158,8 +161,6 @@ def send_telegram(message: str):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
-    # پیام‌های طولانی را تکه‌تکه بفرست (محدودیت ۴۰۹۶ کاراکتر)
     max_len = 4000
     chunks = [message[i:i + max_len] for i in range(0, len(message), max_len)]
 
@@ -183,13 +184,13 @@ def send_telegram(message: str):
 
 # ---------- ۶. اجرای اصلی ----------
 def main():
-    print("🚀 Starting scanner...")
+    print("🚀 Starting LBank scanner...")
     symbols = get_top_symbols()
     if not symbols:
-        send_telegram("⚠️ دریافت لیست ارزها ناموفق بود.")
+        send_telegram("⚠️ دریافت لیست ارزها از LBank ناموفق بود.")
         return
 
-    report_lines = ["📊 *گزارش اسکن Shooting Star — تایم ۴ ساعته*\n"]
+    report_lines = ["📊 *گزارش اسکن Shooting Star — LBank ۴ ساعته*\n"]
     all_wins = all_losses = all_total = 0
 
     for sym in symbols:
@@ -219,15 +220,13 @@ def main():
             report_lines.append(f"`{sym}` → ❌ خطا: {err}\n")
             print(f"❌ {sym}: {e}")
 
-    # خلاصه کل
     overall_rate = (all_wins / all_total * 100) if all_total > 0 else 0.0
     summary = (
         f"\n📈 *خلاصه کل:*\n"
-        f"• کل معاملات بسته‌شده: {all_total}\n"
+        f"• معاملات بسته‌شده: {all_total}\n"
         f"• برد: {all_wins} | باخت: {all_losses}\n"
         f"• *نرخ برد کلی: {overall_rate:.1f}%*\n"
-        f"\n⚙️ تنظیمات: TP=+{TP_PERCENT}% | SL=-{SL_PERCENT}% | "
-        f"نگه‌داری: {MAX_HOLD} کندل"
+        f"\n⚙️ TP=+{TP_PERCENT}% | SL=-{SL_PERCENT}% | نگه‌داری: {MAX_HOLD} کندل"
     )
     report_lines.append(summary)
 
