@@ -23,8 +23,8 @@ SYMBOLS = [
     "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
 ]
 
-SEARCH_PERIOD_HOURLY = "730d"
-LOOKAHEAD    = 100              # تعداد کندل ۴ساعته‌ی بعدی
+SEARCH_PERIOD_DAILY = "10y"      # داده روزانه برای رزمپل به هفتگی
+LOOKAHEAD           = 26         # تعداد کندل هفتگی بعدی (~۶ ماه)
 
 # اهداف و ریزش‌ها (چند هدف × چند ریزش)
 TARGETS       = [20.0, 50.0]
@@ -34,16 +34,16 @@ DD_THRESHOLDS = [2.0, 3.0]
 K_NEIGHBORS      = 100
 MIN_NEIGHBORS    = 50
 MIN_HIT_RATE     = 20.0          # حداقل نرخ برای گزارش
-EXCLUDE_TEMPORAL = 30            # حذف همسایه‌ی هم‌نماد با فاصله‌ی زمانی کم
+EXCLUDE_TEMPORAL = 4             # حذف همسایه‌ی هم‌نماد با فاصله‌ی زمانی کم (هفته)
 DEDUP_DIST       = 0.01
 TOP_PATTERNS     = 25
 
 
 # ==================== توابع ====================
-def fetch_4h(symbol):
-    log(f"📥 دریافت {symbol} (1h→4h)")
+def fetch_weekly(symbol):
+    log(f"📥 دریافت {symbol} (1d→1wk)")
     try:
-        df = yf.download(symbol, interval="1h", period=SEARCH_PERIOD_HOURLY,
+        df = yf.download(symbol, interval="1d", period=SEARCH_PERIOD_DAILY,
                          progress=False, auto_adjust=True, timeout=60)
         if df is None or df.empty:
             return None
@@ -52,15 +52,15 @@ def fetch_4h(symbol):
         df = df[['Open', 'High', 'Low', 'Close']].dropna()
         if df.empty:
             return None
-        df_4h = df.resample('4h').agg({
+        df_wk = df.resample('W-FRI').agg({
             'Open':  'first',
             'High':  'max',
             'Low':   'min',
             'Close': 'last',
         }).dropna()
-        return df_4h if not df_4h.empty else None
+        return df_wk if not df_wk.empty else None
     except Exception as e:
-        log(f"❌ fetch_4h {symbol}: {e}")
+        log(f"❌ fetch_weekly {symbol}: {e}")
         return None
 
 
@@ -143,7 +143,7 @@ def send_message(text, chunk_size=3500):
 # ==================== گزارش ====================
 def build_report(results, baseline, win_base, scan_stats):
     lines = []
-    lines.append("🔍 <b>اسکن الگوهای کندلی ۴ساعته (KDTree)</b>")
+    lines.append("🔍 <b>اسکن الگوهای کندلی هفتگی (KDTree)</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"🎯 اهداف: <code>{', '.join(f'+{T:.0f}٪' for T in TARGETS)}</code>")
     lines.append(f"📉 ریزش‌های مجاز: "
@@ -198,13 +198,13 @@ def build_report(results, baseline, win_base, scan_stats):
 # ==================== اجرای اصلی ====================
 def main():
     log("=" * 60)
-    log("🚀 اسکن الگوهای کندلی ۴ساعته با تحلیل چند-هدفی")
+    log("🚀 اسکن الگوهای کندلی هفتگی با تحلیل چند-هدفی")
     log("=" * 60)
 
-    # ۱) داده‌ی ۴ ساعته
+    # ۱) داده‌ی هفتگی
     dfs = {}
     for sym in SYMBOLS:
-        df = fetch_4h(sym)
+        df = fetch_weekly(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
 
@@ -343,7 +343,7 @@ def main():
         dt = symbol_index[sym][r['candle_idx']]
         if getattr(dt, 'tz', None) is not None:
             dt = dt.tz_localize(None)
-        r['date'] = dt.strftime('%Y-%m-%d %H:%M')
+        r['date'] = dt.strftime('%Y-%m-%d')
         results.append(r)
         log(f"  ✅ {sym} @ {r['date']} | "
             f"win={r['win_rate']:.1f}٪ | "
