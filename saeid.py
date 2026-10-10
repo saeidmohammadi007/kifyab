@@ -1,216 +1,313 @@
 import os
-import pandas as pd
+import sys
+import traceback
+
 import numpy as np
-import yfinance as yf
-from tqdm import tqdm
-import time
+import pandas as pd
 import requests
-import ccxt
+import yfinance as yf
+from scipy.spatial import cKDTree
 
-# --- الگوی مرجع: تک‌کندل روزانه ETH ---
-PATTERN_SYMBOL = 'ETH-USD'
-PATTERN_DATE   = '2025-07-04'
-SHOW_N         = 10
 
-# ---------- توابع ----------
-def get_toobit_futures_symbols():
-    """دریافت تمام ارزهای پایه‌ی فیوچرز Toobit با استفاده از CCXT"""
-    exchange = ccxt.toobit({
-        'options': {'defaultType': 'swap'},
-        'enableRateLimit': True,
-    })
+def log(m):
+    print(m, flush=True)
+
+
+# ==================== تنظیمات ====================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+SYMBOLS = [
+    "LUMIA-USD", "API3-USD", "FIL-USD",
+    "DOGE-USD", "ONDO-USD", "SHIB-USD",
+    "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
+]
+
+SEARCH_PERIOD_HOURLY = "730d"
+LOOKAHEAD     = 100      # کندل ۴ساعته‌ی بعدی که بررسی می‌شود
+TARGET_PCT    = 20.0     # هدف سود (درصد)
+DD_LIMIT      = 3.0      # حداکثر ریزش مجاز قبل از رسیدن به هدف (درصد)
+
+K_NEIGHBORS   = 60       # تعداد همسایه‌های نزدیک که بررسی می‌شوند
+MIN_NEIGHBORS = 30       # حداقل همسایه برای اعتبار
+MIN_HIT_RATE  = 20.0     # حداقل درصد موفقیت برای گزارش
+EXCLUDE_TEMPORAL = 30    # حذف همسایه‌های زمانی نزدیک (نشتی داده)
+DEDUP_DIST    = 0.01     # آستانه‌ی حذف الگوهای تکراری در فضای ویژگی
+TOP_PATTERNS  = 25       # چند الگوی برتر گزارش شود
+
+
+# ==================== توابع ====================
+def fetch_4h(symbol):
+    log(f"📥 دریافت {symbol} (1h→4h)")
     try:
-        markets = exchange.load_markets()
+        df = yf.download(symbol, interval="1h", period=SEARCH_PERIOD_HOURLY,
+                         progress=False, auto_adjust=True, timeout=60)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[['Open', 'High', 'Low', 'Close']].dropna()
+        if df.empty:
+            return None
+        df_4h = df.resample('4h').agg({
+            'Open':  'first',
+            'High':  'max',
+            'Low':   'min',
+            'Close': 'last',
+        }).dropna()
+        return df_4h if not df_4h.empty else None
     except Exception as e:
-        print(f"❌ خطا در اتصال به Toobit: {e}")
-        return []
-
-    base_list = []
-    for symbol, market in markets.items():
-        if not market.get('swap'):
-            continue
-        base = market.get('base')
-        if not base or base.isdigit():
-            continue
-        base_list.append(base.upper())
-
-    seen, unique_bases = set(), []
-    for b in base_list:
-        if b not in seen:
-            seen.add(b)
-            unique_bases.append(b)
-    print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز Toobit: {len(unique_bases)}")
-    return unique_bases
-
-def get_daily_data(ticker, start='2024-01-01'):
-    df = yf.download(ticker, start=start, interval='1d',
-                     progress=False, auto_adjust=False)
-    if df.empty:
+        log(f"❌ fetch_4h {symbol}: {e}")
         return None
-    df = df[['Open', 'High', 'Low', 'Close']].copy()
-    df.index = pd.to_datetime(df.index)
-    df.columns = ['open', 'high', 'low', 'close']
-    return df
 
-def get_4h_data(ticker, start_date=None, end_date=None):
+
+def candle_features(o, h, l, c, i):
+    op, hi, lo, cl = o[i], h[i], l[i], c[i]
+    if op <= 0:
+        return None
+    body        = (cl - op) / op
+    upper_wick  = (hi - max(op, cl)) / op
+    lower_wick  = (min(op, cl) - lo) / op
+    total_range = (hi - lo) / op
+    return np.array([body, upper_wick, lower_wick, total_range], dtype=float)
+
+
+def forward_outcome(o, h, l, c, i, lookahead, target_pct, dd_limit):
     """
-    اگر start_date داده شود، داده‌ی ساعتی در همان بازه گرفته و به 4h تبدیل می‌شود.
-    در غیر این صورت 60 روز اخیر.
+    1 اگر هدف با ریزش کمتر از dd_limit خورد،
+    0 اگر هدف نخورد یا با ریزش بیشتر خورد،
+    None اگر دیتای کافی برای آینده نبود.
     """
-    try:
-        if start_date:
-            df = yf.download(ticker,
-                             start=start_date,
-                             end=end_date,
-                             interval='1h',
-                             progress=False,
-                             auto_adjust=False)
-        else:
-            df = yf.download(ticker, period='60d', interval='1h',
-                             progress=False, auto_adjust=False)
-    except Exception:
+    n = len(c)
+    if i + 1 + lookahead > n:
+        return None
+    entry = float(c[i])
+    if entry <= 0:
+        return None
+    end = i + 1 + lookahead
+    fut_h = h[i + 1:end]
+    fut_l = l[i + 1:end]
+    if len(fut_h) == 0:
         return None
 
-    if df is None or df.empty:
-        return None
+    target_price = entry * (1.0 + target_pct / 100.0)
+    hits = np.where(fut_h >= target_price)[0]
+    if len(hits) == 0:
+        return 0
+    k = int(hits[0])
+    min_low = float(np.min(fut_l[:k + 1]))
+    dd = (min_low - entry) / entry * 100.0     # منفی
+    return 1 if dd >= -dd_limit else 0
 
-    df = df[['Open', 'High', 'Low', 'Close']].copy()
-    df.index = pd.to_datetime(df.index)
-    df.columns = ['open', 'high', 'low', 'close']
 
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-
-    df_4h = df.resample('4h').agg({
-        'open':   'first',
-        'high':   'max',
-        'low':    'min',
-        'close':  'last',
-    }).dropna()
-    return df_4h
-
-def candle_vector(o, h, l, c):
-    """بردار ۴بعدی نرمال‌شده‌ی کندل نسبت به دامنه High−Low"""
-    rng = float(h - l)
-    if rng <= 0 or not np.isfinite(rng):
-        return None
-    return np.array([
-        (float(o) - float(l)) / rng,
-        1.0,
-        0.0,
-        (float(c) - float(l)) / rng,
-    ])
-
-def send_telegram_message(text):
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
-    if not token or not chat_id:
-        print("❌ توکن یا chat_id تنظیم نشده است.")
+# ==================== تلگرام ====================
+def send_message(text, chunk_size=3500):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        log("⚠️ توکن یا chat_id موجود نیست.")
         return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"⚠️ خطا در ارسال پیام: {r.text}")
+    lines = text.split("\n")
+    chunks, cur = [], ""
+    for ln in lines:
+        if len(cur) + len(ln) + 1 > chunk_size and cur:
+            chunks.append(cur)
+            cur = ln
         else:
-            print("✅ پیام با موفقیت به تلگرام ارسال شد.")
-    except Exception as e:
-        print(f"❌ خطا در ارسال به تلگرام: {e}")
+            cur = (cur + "\n" + ln) if cur else ln
+    if cur:
+        chunks.append(cur)
 
-# ---------- اجرای اصلی ----------
-print(f"🔍 استخراج کندل مرجع {PATTERN_SYMBOL} در تاریخ {PATTERN_DATE} (روزانه) ...")
-ref_daily = get_daily_data(PATTERN_SYMBOL, start='2024-01-01')
-if ref_daily is None:
-    print(f"❌ خطا در دریافت داده‌های {PATTERN_SYMBOL}")
-    exit()
+    for i, chunk in enumerate(chunks, 1):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk,
+                      "parse_mode": "HTML"},
+                timeout=30,
+            )
+            log(f"📤 telegram part {i}/{len(chunks)}: {r.status_code}")
+            if r.status_code != 200:
+                log(f"   err: {r.text[:200]}")
+        except Exception as e:
+            log(f"❌ send part {i}: {e}")
 
-target_date = pd.to_datetime(PATTERN_DATE).date()
-mask = ref_daily.index.date == target_date
-if not mask.any():
-    print(f"❌ کندلی برای تاریخ {PATTERN_DATE} یافت نشد.")
-    exit()
 
-candle = ref_daily[mask].iloc[0]
-o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
-pattern_vec = candle_vector(o, h, l, c)
-if pattern_vec is None:
-    print("❌ کندل مرجع نامعتبر است.")
-    exit()
-
-print(f"📌 کندل مرجع (روزانه): O={o:.4f}  H={h:.4f}  L={l:.4f}  C={c:.4f}")
-print(f"📐 بردار الگو: O={pattern_vec[0]:.3f} | H={pattern_vec[1]:.3f} | "
-      f"L={pattern_vec[2]:.3f} | C={pattern_vec[3]:.3f}")
-
-# --- بازه‌ی زمانی برای دریافت کندل ۴ ساعته‌ی «قبلی» متناظر با تاریخ الگو ---
-pattern_dt    = pd.to_datetime(PATTERN_DATE)
-scan_end_dt   = pattern_dt
-scan_start_dt = pattern_dt - pd.Timedelta(days=10)
-
-scan_start_str = scan_start_dt.strftime('%Y-%m-%d')
-scan_end_str   = scan_end_dt.strftime('%Y-%m-%d')
-
-print(f"\n🕒 بازه‌ی دریافت کندل ۴ ساعته: {scan_start_str} تا {scan_end_str}")
-print(f"🎯 کندل هدف: آخرین کندل ۴ ساعته‌ی کامل‌شده قبل از {PATTERN_DATE}")
-
-print("\n📊 دریافت نمادهای فیوچرز Toobit ...")
-symbols = get_toobit_futures_symbols()
-if not symbols:
-    print("❌ هیچ نمادی برای اسکن وجود ندارد!")
-    exit()
-
-results = []
-for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
-    try:
-        df_4h = get_4h_data(f"{sym}-USD",
-                            start_date=scan_start_str,
-                            end_date=scan_end_str)
-        if df_4h is None or len(df_4h) < 5:
-            continue
-
-        prev = df_4h.iloc[-1]
-
-        vec = candle_vector(prev['open'], prev['high'],
-                            prev['low'],  prev['close'])
-        if vec is None:
-            continue
-
-        dist = float(np.linalg.norm(pattern_vec - vec))
-
-        results.append({
-            'symbol':   sym,
-            'dist':     dist,
-            'last_4h':  df_4h.index[-1].strftime('%Y-%m-%d %H:%M'),
-            'o': float(prev['open']),
-            'h': float(prev['high']),
-            'l': float(prev['low']),
-            'c': float(prev['close']),
-        })
-        time.sleep(0.1)
-    except Exception:
-        continue
-
-if results:
-    df_res = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
-
+# ==================== گزارش ====================
+def build_report(results, base_rate):
     lines = []
-    lines.append(f"🏆 <b>کندل‌های ۴ ساعته‌ی مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
-    lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
-    lines.append(f"🎯 کندل هدف ۴h: منتهی به 20:00 روز قبل از {PATTERN_DATE}\n")
-    for _, row in df_res.iterrows():
-        lines.append(
-            f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
-            f"   زمان ۴h: {row['last_4h']} | "
-            f"O={row['o']:.6g} H={row['h']:.6g} "
-            f"L={row['l']:.6g} C={row['c']:.6g}"
-        )
-    lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
-    message = "\n".join(lines)
+    lines.append("🔍 <b>اسکن الگوهای کندلی ۴ساعته</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🎯 هدف: <b>+{TARGET_PCT:.0f}٪</b> با ریزش کمتر از "
+                 f"<b>{DD_LIMIT:.0f}٪</b>")
+    lines.append(f"📊 نرخ پایه‌ی کل (baseline): <code>{base_rate:.1f}٪</code>")
+    lines.append(f"✅ آستانه‌ی گزارش: <code>{MIN_HIT_RATE:.0f}٪</code>")
+    lines.append(f"🧮 تعداد الگوهای برتر: <code>{len(results)}</code>")
+    lines.append("")
 
-    send_telegram_message(message)
-    print("\n" + message)
-else:
-    print("\n❌ نتیجه‌ای یافت نشد.")
-    send_telegram_message("❌ در اسکن امروز هیچ نتیجه‌ای یافت نشد.")
+    if not results:
+        lines.append("❌ هیچ الگویی با نرخ موفقیت مورد نیاز پیدا نشد.")
+        return "\n".join(lines)
 
-print("\n✅ اسکن کامل شد!")
+    for i, r in enumerate(results, 1):
+        edge = r['rate'] - base_rate
+        lines.append(f"<b>#{i} — {r['symbol']} @ {r['date']}</b>")
+        lines.append(f"   📈 نرخ موفقیت: <code>{r['rate']:.1f}٪</code> "
+                     f"({r['n_hits']} از {r['n_neighbors']})")
+        lines.append(f"   🎯 برتری نسبت به پایه: <code>{edge:+.1f}٪</code>")
+        f = r['feat']
+        lines.append(f"   🕯 بدنه <code>{f[0]*100:+.2f}٪</code> | "
+                     f"سایه‌بالا <code>{f[1]*100:.2f}٪</code> | "
+                     f"سایه‌پایین <code>{f[2]*100:.2f}٪</code> | "
+                     f"دامنه <code>{f[3]*100:.2f}٪</code>")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+# ==================== اجرای اصلی ====================
+def main():
+    log("=" * 60)
+    log("🚀 اسکن الگوهای کندلی با نرخ موفقیت بالا")
+    log("=" * 60)
+
+    # ۱) داده‌ی ۴ ساعته
+    dfs = {}
+    for sym in SYMBOLS:
+        df = fetch_4h(sym)
+        if df is not None and len(df) > LOOKAHEAD + 10:
+            dfs[sym] = df
+
+    missing = [s for s in SYMBOLS if s not in dfs]
+    if missing:
+        log(f"⚠️ بدون داده: {missing}")
+    if not dfs:
+        raise RuntimeError("هیچ داده‌ای دریافت نشد.")
+
+    # ۲) ساخت دیتاست ویژگی + نتیجه
+    all_feats    = []
+    all_outcomes = []
+    all_meta     = []      # (symbol, candle_idx)
+    symbol_index = {}      # برای دسترسی به date
+
+    for sym, df in dfs.items():
+        o = df['Open'].values.astype(float)
+        h = df['High'].values.astype(float)
+        l = df['Low'].values.astype(float)
+        c = df['Close'].values.astype(float)
+        symbol_index[sym] = df.index
+        n = len(df)
+
+        for i in range(n):
+            feat = candle_features(o, h, l, c, i)
+            if feat is None:
+                continue
+            outcome = forward_outcome(o, h, l, c, i,
+                                      LOOKAHEAD, TARGET_PCT, DD_LIMIT)
+            if outcome is None:
+                continue
+            all_feats.append(feat)
+            all_outcomes.append(outcome)
+            all_meta.append((sym, i))
+
+    feats    = np.array(all_feats, dtype=float)
+    outcomes = np.array(all_outcomes, dtype=int)
+    log(f"\n📊 کل نمونه‌ها: {len(feats)}")
+    base_rate = float(outcomes.mean() * 100.0)
+    log(f"📊 نرخ پایه‌ی موفقیت (baseline): {base_rate:.2f}٪")
+    log(f"📊 تعداد موفق‌ها: {int(outcomes.sum())} از {len(outcomes)}")
+
+    if len(feats) < MIN_NEIGHBORS * 2:
+        raise RuntimeError("نمونه‌ها برای تحلیل کافی نیستند.")
+
+    # ۳) KDTree
+    log("\n🌳 ساخت KDTree...")
+    tree = cKDTree(feats)
+
+    k = min(K_NEIGHBORS + 1, len(feats))
+    log(f"🔍 جستجوی {k-1} همسایه برای هر نمونه...")
+    dists, idxs = tree.query(feats, k=k)
+
+    # ۴) امتیازدهی
+    candidates = []
+    for i in range(len(feats)):
+        sym_i, ci = all_meta[i]
+        nb_idx = idxs[i]
+
+        valid = []
+        for j in nb_idx:
+            if j == i:
+                continue
+            sym_j, cj = all_meta[j]
+            # حذف همسایه‌های هم‌نماد با فاصله‌ی زمانی کم (جلوگیری از نشتی)
+            if sym_j == sym_i and abs(cj - ci) <= EXCLUDE_TEMPORAL:
+                continue
+            valid.append(j)
+
+        if len(valid) < MIN_NEIGHBORS:
+            continue
+
+        nb_out = outcomes[valid]
+        rate = float(nb_out.mean() * 100.0)
+
+        if rate >= MIN_HIT_RATE:
+            candidates.append({
+                'idx':         i,
+                'symbol':      sym_i,
+                'candle_idx':  ci,
+                'feat':        feats[i],
+                'rate':        rate,
+                'n_neighbors': len(valid),
+                'n_hits':      int(nb_out.sum()),
+            })
+
+    log(f"\n🎯 کاندیدهای اولیه: {len(candidates)}")
+    if not candidates:
+        report = build_report([], base_rate)
+        send_message(report)
+        log("⚠️ هیچ الگویی بالای آستانه پیدا نشد.")
+        return
+
+    # ۵) حذف تکراری‌ها (نزدیک در فضای ویژگی)
+    candidates.sort(key=lambda x: -x['rate'])
+    picked = []
+    for cand in candidates:
+        too_similar = False
+        for p in picked:
+            if np.linalg.norm(cand['feat'] - p['feat']) < DEDUP_DIST:
+                too_similar = True
+                break
+        if not too_similar:
+            picked.append(cand)
+        if len(picked) >= TOP_PATTERNS:
+            break
+
+    log(f"🏆 الگوهای یکتای نهایی: {len(picked)}")
+
+    # ۶) افزودن تاریخ به نتیجه
+    results = []
+    for r in picked:
+        sym = r['symbol']
+        dt  = symbol_index[sym][r['candle_idx']]
+        if getattr(dt, 'tz', None) is not None:
+            dt = dt.tz_localize(None)
+        r['date'] = dt.strftime('%Y-%m-%d %H:%M')
+        results.append(r)
+        log(f"  ✅ {sym} @ {r['date']} | "
+            f"rate={r['rate']:.1f}% | "
+            f"n={r['n_neighbors']} | "
+            f"edge={r['rate']-base_rate:+.1f}%")
+
+    # ۷) گزارش و ارسال
+    report = build_report(results, base_rate)
+    plain = (report.replace("<b>", "").replace("</b>", "")
+                   .replace("<code>", "").replace("</code>", ""))
+    log("\n" + plain)
+    send_message(report)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log(f"❌ خطا: {e}")
+        traceback.print_exc()
+        sys.exit(1)
