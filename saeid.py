@@ -23,38 +23,43 @@ SYMBOLS = [
     "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
 ]
 
-SEARCH_PERIOD_DAILY = "10y"
-LOOKAHEAD           = 26
+# ⚠️ yfinance برای interval=1h حداکثر period=730d می‌دهد
+SEARCH_PERIOD_HOURLY = "730d"
+
+# Lookahead بر حسب کندل 4h
+#   6 کندل 4h = 1 روز | 42 کندل ≈ 1 هفته | 182 کندل ≈ 1 ماه
+LOOKAHEAD = 42  # ≈ 1 هفته پس از الگو
 
 TARGETS       = [20.0, 50.0]
 DD_THRESHOLDS = [2.0, 3.0]
 
-K_NEIGHBORS      = 100
-MIN_NEIGHBORS    = 50
-MIN_HIT_RATE     = 20.0
-EXCLUDE_TEMPORAL = 4
-DEDUP_DIST       = 0.01
-TOP_PATTERNS     = 25
+K_NEIGHBORS   = 100
+MIN_NEIGHBORS = 50
+MIN_HIT_RATE  = 20.0
 
-WEEK_START = "MON"
+# ⚠️ معادل زمانی: 4 هفته × 7 روز × 6 کندل/روز = 168 کندل 4h
+EXCLUDE_TEMPORAL = 168
+
+DEDUP_DIST   = 0.01
+TOP_PATTERNS = 25
 
 # ⚠️ حالت ورود:
-#   "next_open" → ورود روی Open کندل هفته‌ی بعد (واقع‌گرایانه) ✅
-#   "ref_close" → ورود روی Close کندل الگو (خوش‌بینانه، کد قبلی)
+#   "next_open" → ورود روی Open کندل 4h بعدی (واقع‌گرایانه) ✅
+#   "ref_close" → ورود روی Close کندل الگو (خوش‌بینانه)
 ENTRY_MODE = "next_open"
 
-# ⚠️ کف تاریخی نمونه‌ها — yfinance قبل از این تاریخ سایه‌های کریپتو را ناقص می‌دهد
-MIN_SAMPLE_DATE = "2019-01-01"
+# ⚠️ کف تاریخی نمونه‌ها — داده 1h از yfinance فقط ~2 سال عقب می‌رود
+MIN_SAMPLE_DATE = "2024-01-01"
 
-# ⚠️ اگر True باشد، برای هر کاندید منتخب، مقدار Low واقعی در پنجره‌ی lookahead چاپ می‌شود
+# ⚠️ اگر True باشد، برای کاندیدهای منتخب مقدار Low واقعی پنجره‌ی lookahead چاپ می‌شود
 DEBUG_LOWS = True
 
 
 # ==================== توابع ====================
-def fetch_weekly(symbol):
-    log(f"📥 دریافت {symbol} (1d→1wk, شروع هفته={WEEK_START})")
+def fetch_4h(symbol):
+    log(f"📥 دریافت {symbol} (1h → 4h)")
     try:
-        df = yf.download(symbol, interval="1d", period=SEARCH_PERIOD_DAILY,
+        df = yf.download(symbol, interval="1h", period=SEARCH_PERIOD_HOURLY,
                          progress=False, auto_adjust=True, timeout=60)
         if df is None or df.empty:
             return None
@@ -68,35 +73,30 @@ def fetch_weekly(symbol):
             df.index = pd.to_datetime(df.index)
         if df.index.tz is not None:
             df.index = df.index.tz_convert('UTC').tz_localize(None)
-        df.index = df.index.normalize()
 
-        rule = 'W-MON' if WEEK_START == "MON" else 'W-SUN'
-
-        df_wk = df.resample(rule, label='left', closed='left').agg({
+        df_4h = df.resample('4h', label='left', closed='left').agg({
             'Open':  'first',
             'High':  'max',
             'Low':   'min',
             'Close': 'last',
         }).dropna()
 
-        return df_wk if not df_wk.empty else None
+        return df_4h if not df_4h.empty else None
     except Exception as e:
-        log(f"❌ fetch_weekly {symbol}: {e}")
+        log(f"❌ fetch_4h {symbol}: {e}")
         traceback.print_exc()
         return None
 
 
-def verify_weekly_alignment(df, symbol):
+def verify_4h_alignment(df, symbol):
     if df is None or df.empty:
         return
-    wd = set(d.weekday() for d in df.index)
-    names = {0:'Mon',1:'Tue',2:'Wed',3:'Thu',4:'Fri',5:'Sat',6:'Sun'}
-    wd_str = ", ".join(names[w] for w in sorted(wd))
-    log(f"   🔎 {symbol}: {len(df)} کندل | "
-        f"{df.index[0].date()} → {df.index[-1].date()} | "
-        f"weekdays={wd_str}")
+    hours = set(d.hour for d in df.index)
+    log(f"   🔎 {symbol}: {len(df)} کندل 4h | "
+        f"{df.index[0]} → {df.index[-1]} | "
+        f"hours={sorted(hours)}")
     for dt, row in df.head(2).iterrows():
-        log(f"      {dt.date()} ({names[dt.weekday()]}) | "
+        log(f"      {dt} | "
             f"O={row['Open']:.6f} H={row['High']:.6f} "
             f"L={row['Low']:.6f} C={row['Close']:.6f}")
 
@@ -195,10 +195,10 @@ def send_message(text, chunk_size=3500):
 # ==================== گزارش ====================
 def build_report(results, baseline, win_base, scan_stats):
     lines = []
-    lines.append("🔍 <b>اسکن الگوهای کندلی هفتگی (KDTree)</b>")
+    lines.append("🔍 <b>اسکن الگوهای کندلی 4 ساعته (KDTree)</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📅 شروع هفته: <code>{WEEK_START}</code> | "
-                 f"Lookahead: <code>{LOOKAHEAD}w</code>")
+    lines.append(f"⏱ تایم‌فریم: <code>4h</code> | "
+                 f"Lookahead: <code>{LOOKAHEAD} کندل</code>")
     lines.append(f"🎯 اهداف: <code>{', '.join(f'+{T:.0f}٪' for T in TARGETS)}</code>")
     lines.append(f"📉 ریزش‌های مجاز: "
                  f"<code>{', '.join(f'{D:.0f}٪' for D in DD_THRESHOLDS)}</code>")
@@ -252,16 +252,16 @@ def build_report(results, baseline, win_base, scan_stats):
 # ==================== اجرای اصلی ====================
 def main():
     log("=" * 60)
-    log("🚀 اسکن الگوهای کندلی هفتگی با تحلیل چند-هدفی")
+    log("🚀 اسکن الگوهای کندلی 4 ساعته با تحلیل چند-هدفی")
     log(f"   حالت ورود: {ENTRY_MODE} | کف نمونه: {MIN_SAMPLE_DATE}")
     log("=" * 60)
 
     dfs = {}
     for sym in SYMBOLS:
-        df = fetch_weekly(sym)
+        df = fetch_4h(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
-            verify_weekly_alignment(df, sym)
+            verify_4h_alignment(df, sym)
         elif df is not None:
             log(f"   ⚠️ {sym}: فقط {len(df)} کندل (نیاز > {LOOKAHEAD+10})")
 
@@ -288,7 +288,6 @@ def main():
 
         n_skipped_by_date = 0
         for i in range(n):
-            # ⚠️ فیلتر کف تاریخی
             if df.index[i] < min_dt:
                 n_skipped_by_date += 1
                 continue
@@ -404,13 +403,12 @@ def main():
         dt = symbol_index[sym][r['candle_idx']]
         if getattr(dt, 'tz', None) is not None:
             dt = dt.tz_localize(None)
-        r['date'] = dt.strftime('%Y-%m-%d (%a)')
+        r['date'] = dt.strftime('%Y-%m-%d %H:%M')
         results.append(r)
         log(f"  ✅ {sym} @ {r['date']} | "
             f"win={r['win_rate']:.1f}٪ | "
             f"best={r['best_rate']:.1f}٪ | n={r['n_neighbors']}")
 
-    # ⚠️ دیباگ: برای ۵ کاندید اول، مقدار ورود و کمترین Low چاپ شود
     if DEBUG_LOWS:
         log("\n🔬 دیباگ مقدار ورود و Low (برای تأیید در TradingView):")
         for r in picked[:5]:
@@ -423,7 +421,6 @@ def main():
                 entry = o[i + 1] if i + 1 < len(o) else None
             else:
                 entry = c[i]
-            # Low ۲۶ هفته بعد
             fut_l = df['Low'].values.astype(float)[i + 1:i + 1 + LOOKAHEAD]
             if len(fut_l) > 0 and entry is not None:
                 min_low = fut_l.min()
