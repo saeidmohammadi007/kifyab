@@ -23,24 +23,21 @@ SYMBOLS = [
     "BLESS-USD", "ROSE-USD", "LINEA-USD", "JTO-USD",
 ]
 
-SEARCH_PERIOD_DAILY = "10y"      # داده روزانه برای رزمپل به هفتگی
-LOOKAHEAD           = 26         # تعداد کندل هفتگی بعدی (~۶ ماه)
+SEARCH_PERIOD_DAILY = "10y"
+LOOKAHEAD           = 26
 
-# اهداف و ریزش‌ها (چند هدف × چند ریزش)
 TARGETS       = [20.0, 50.0]
 DD_THRESHOLDS = [2.0, 3.0]
 
-# KDTree
 K_NEIGHBORS      = 100
 MIN_NEIGHBORS    = 50
-MIN_HIT_RATE     = 20.0          # حداقل نرخ برای گزارش
-EXCLUDE_TEMPORAL = 4             # حذف همسایه‌ی هم‌نماد با فاصله‌ی زمانی کم (هفته)
+MIN_HIT_RATE     = 20.0
+EXCLUDE_TEMPORAL = 4
 DEDUP_DIST       = 0.01
 TOP_PATTERNS     = 25
 
-# نحوه‌ی هفته‌بندی (برای هم‌راستایی با TradingView)
-# "MON" → دوشنبه تا یکشنبه (پیش‌فرض TradingView کریپتو)
-# "SUN" → یکشنبه تا شنبه
+# شروع هفته: "MON" = دوشنبه→یکشنبه (استاندارد TradingView برای کریپتو)
+#             "SUN" = یکشنبه→شنبه
 WEEK_START = "MON"
 
 
@@ -58,13 +55,22 @@ def fetch_weekly(symbol):
         if df.empty:
             return None
 
-        # هفته‌بندی با برچسب = شروع هفته
-        # W-SUN → دوره = دوشنبه..یکشنبه، برچسب چپ = دوشنبه
-        # W-SAT → دوره = یکشنبه..شنبه، برچسب چپ = یکشنبه
+        # اطمینان از DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+        # نرمال‌سازی timezone و زمان (همه در نیمه‌شب، naive)
+        if df.index.tz is not None:
+            df.index = df.index.tz_convert('UTC').tz_localize(None)
+        df.index = df.index.normalize()
+
+        # 🔑 anchor درست برای هم‌راستایی با TradingView
+        # W-MON با label='left' → باکت = [دوشنبه، یکشنبه] و برچسب = دوشنبه
+        # W-SUN با label='left' → باکت = [یکشنبه، شنبه] و برچسب = یکشنبه
         if WEEK_START == "MON":
-            rule = 'W-SUN'
+            rule = 'W-MON'
         else:
-            rule = 'W-SAT'
+            rule = 'W-SUN'
 
         df_wk = df.resample(rule, label='left', closed='left').agg({
             'Open':  'first',
@@ -76,7 +82,25 @@ def fetch_weekly(symbol):
         return df_wk if not df_wk.empty else None
     except Exception as e:
         log(f"❌ fetch_weekly {symbol}: {e}")
+        traceback.print_exc()
         return None
+
+
+def verify_weekly_alignment(df, symbol):
+    """نمایش نمونه برای بررسی هم‌راستایی با TradingView"""
+    if df is None or df.empty:
+        return
+    wd = set(d.weekday() for d in df.index)
+    names = {0:'Mon',1:'Tue',2:'Wed',3:'Thu',4:'Fri',5:'Sat',6:'Sun'}
+    wd_str = ", ".join(names[w] for w in sorted(wd))
+    log(f"   🔎 {symbol}: {len(df)} کندل | "
+        f"{df.index[0].date()} → {df.index[-1].date()} | "
+        f"weekdays={wd_str}")
+    # نمایش ۲ کندل اول برای تست دستی
+    for dt, row in df.head(2).iterrows():
+        log(f"      {dt.date()} ({names[dt.weekday()]}) | "
+            f"O={row['Open']:.6f} H={row['High']:.6f} "
+            f"L={row['Low']:.6f} C={row['Close']:.6f}")
 
 
 def candle_features(o, h, l, c, i):
@@ -91,7 +115,6 @@ def candle_features(o, h, l, c, i):
 
 
 def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
-    """تحلیل فوروارد چند-هدفی/چند-ریزشی"""
     if entry_idx + 1 + lookahead > n:
         return None
     entry_price = float(c[entry_idx])
@@ -169,7 +192,6 @@ def build_report(results, baseline, win_base, scan_stats):
                  f"K همسایه: <code>{K_NEIGHBORS}</code>")
     lines.append("")
 
-    # نرخ پایه
     lines.append("📊 <b>نرخ پایه (baseline):</b>")
     lines.append(f"├ سوددهی کلی: <code>{win_base:.1f}٪</code>")
     for T in TARGETS:
@@ -191,7 +213,6 @@ def build_report(results, baseline, win_base, scan_stats):
                      f"سوددهی <code>{r['win_rate']:.1f}٪</code> "
                      f"(پایه {win_base:.1f}٪ | "
                      f"edge <code>{r['win_rate']-win_base:+.1f}٪</code>)")
-        # جدول اهداف
         for T in TARGETS:
             for D in DD_THRESHOLDS:
                 hit = r[f'rate_{T}_dd{D}']
@@ -218,14 +239,14 @@ def main():
     log("🚀 اسکن الگوهای کندلی هفتگی با تحلیل چند-هدفی")
     log("=" * 60)
 
-    # ۱) داده‌ی هفتگی
     dfs = {}
     for sym in SYMBOLS:
         df = fetch_weekly(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
-            log(f"   ✅ {sym}: {len(df)} کندل هفتگی | "
-                f"{df.index[0].date()} → {df.index[-1].date()}")
+            verify_weekly_alignment(df, sym)
+        elif df is not None:
+            log(f"   ⚠️ {sym}: فقط {len(df)} کندل (نیاز > {LOOKAHEAD+10})")
 
     missing = [s for s in SYMBOLS if s not in dfs]
     if missing:
@@ -233,9 +254,8 @@ def main():
     if not dfs:
         raise RuntimeError("هیچ داده‌ای دریافت نشد.")
 
-    # ۲) ساخت دیتاست
     all_feats    = []
-    all_meta     = []          # (symbol, candle_idx)
+    all_meta     = []
     all_outcomes = []
     symbol_index = {}
 
@@ -264,7 +284,6 @@ def main():
     if n_samples < MIN_NEIGHBORS * 2:
         raise RuntimeError("نمونه‌ها برای تحلیل کافی نیستند.")
 
-    # ۳) نرخ پایه
     win_base = sum(1 for o in all_outcomes if o['ret'] > 0) / n_samples * 100.0
     baseline = {}
     for T in TARGETS:
@@ -276,14 +295,12 @@ def main():
     for (T, D), v in baseline.items():
         log(f"   +{T:.0f}٪ / DD≤{D:.0f}٪: {v:.2f}٪")
 
-    # ۴) KDTree
     log("\n🌳 ساخت KDTree...")
     tree = cKDTree(feats)
     k = min(K_NEIGHBORS + 1, n_samples)
     log(f"🔍 جستجوی {k-1} همسایه برای هر نمونه...")
     dists, idxs = tree.query(feats, k=k)
 
-    # ۵) امتیازدهی
     log("\n🎯 امتیازدهی نمونه‌ها...")
     candidates = []
 
@@ -307,14 +324,12 @@ def main():
 
         win_rate = sum(1 for o in nb_out if o['ret'] > 0) / n_nb * 100.0
 
-        # نرخ‌های هر ترکیب هدف/ریزش
         rates = {}
         for T in TARGETS:
             for D in DD_THRESHOLDS:
                 cnt = sum(1 for o in nb_out if o[f'hit_{T}_dd{D}'])
                 rates[(T, D)] = cnt / n_nb * 100.0
 
-        # شرط گزارش: حداقل برای یکی از ترکیب‌ها نرخ بالای آستانه
         best_rate = max(rates.values())
         if best_rate < MIN_HIT_RATE:
             continue
@@ -339,7 +354,6 @@ def main():
         send_message(report)
         return
 
-    # ۶) حذف تکراری‌ها
     candidates.sort(key=lambda x: -x['best_rate'])
     picked = []
     for cand in candidates:
@@ -355,21 +369,18 @@ def main():
 
     log(f"🏆 الگوهای یکتای نهایی: {len(picked)}")
 
-    # ۷) افزودن تاریخ (برچسب = شروع هفته، مثل TradingView)
     results = []
     for r in picked:
         sym = r['symbol']
         dt = symbol_index[sym][r['candle_idx']]
         if getattr(dt, 'tz', None) is not None:
             dt = dt.tz_localize(None)
-        # فرمت: YYYY-MM-DD (Mon) — قابل مقایسه مستقیم با TradingView
         r['date'] = dt.strftime('%Y-%m-%d (%a)')
         results.append(r)
         log(f"  ✅ {sym} @ {r['date']} | "
             f"win={r['win_rate']:.1f}٪ | "
             f"best={r['best_rate']:.1f}٪ | n={r['n_neighbors']}")
 
-    # ۸) گزارش و ارسال
     report = build_report(results, baseline, win_base,
                           {'n_samples': n_samples})
     plain = (report.replace("<b>", "").replace("</b>", "")
