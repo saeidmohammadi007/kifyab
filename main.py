@@ -16,10 +16,9 @@ def log(m):
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# 🕯 نماد هدف — همه‌ی کندل‌های این نماد اسکن می‌شوند
 TARGET_SYMBOL = "API3-USD"
 
-# ─── داده‌ی کاندیدها (4h) ───
+# ─── داده ───
 SEARCH_PERIOD = "730d"
 INTERVAL_SRC  = "1h"
 RESAMPLE_RULE = "4h"
@@ -36,12 +35,11 @@ SYMBOLS = [
 MIN_CANDIDATE_DATE = "2024-10-01"
 MAX_CANDIDATE_DATE = "2026-12-31"
 
-EXCLUDE_EXACT_TARGET_CANDLE = True
-# اگر True باشد، کاندیدها فقط قبل از کندل مرجع قرار می‌گیرند
-RESTRICT_CANDIDATES_BEFORE_TARGET = False
+EXCLUDE_EXACT_TARGET_CANDLE     = True
+RESTRICT_CANDIDATES_BEFORE_TARGET = False   # True = بدون look-ahead
 
 # ─── حالت ورود ───
-ENTRY_MODE = "next_open"   # "next_open" یا "ref_close"
+ENTRY_MODE = "next_open"
 
 # ─── پارامترهای جستجو ───
 LOOKAHEAD              = 42
@@ -49,20 +47,18 @@ K_PER_SYMBOL           = 20
 TOTAL_TOP              = 100
 EXCLUDE_TEMPORAL_HOURS = 168
 
-TARGETS       = [2.0, 20.0, 50.0]
+TARGETS       = [2.0, 4.0, 20.0, 50.0]
 DD_THRESHOLDS = [1.0, 2.0, 3.0]
 
+# 🎯 ریزش کاملاً زیر ۱٪ (نه مساوی) برای DD=1
+STRICT_DD1 = True
+
 # ─── اسکن و رتبه‌بندی ───
-# معیار رتبه‌بندی: "exp_val" | "edge" | "pct_2_dd1" | "win_pct"
-RANK_BY       = "exp_val"
+RANK_BY       = "hit_4_dd1"   # "hit_4_dd1" | "hit_2_dd1" | "exp_val" | "edge" | "win_pct"
 TOP_N_TO_SEND = 5
 
-# حداکثر تعداد کندل مرجع برای بررسی (None = همه)
-MAX_TARGETS_TO_SCAN = None
-
-# حداقل تعداد الگوی مشابه برای معتبر بودن یک کندل مرجع
-MIN_PATTERNS = 10
-
+MAX_TARGETS_TO_SCAN = None    # None = همه
+MIN_PATTERNS        = 10
 ONE_CANDIDATE_PER_WEEK = True
 
 
@@ -101,13 +97,8 @@ def fetch_4h(symbol):
         return None
 
 
-# ==================== ماتریس ویژگی (برداری) ====================
+# ==================== ویژگی برداری ====================
 def build_feature_matrix(df, pattern_len=PATTERN_LEN):
-    """
-    خروجی: آرایه (n, 4*pattern_len)
-    هر ردیف = [body, upper, lower, range] برای pattern_len کندل منتهی به آن ردیف
-    ردیف‌های ابتدایی که پنجره کامل ندارند NaN می‌شوند.
-    """
     o = df["Open"].values.astype(float)
     h = df["High"].values.astype(float)
     l = df["Low"].values.astype(float)
@@ -119,9 +110,8 @@ def build_feature_matrix(df, pattern_len=PATTERN_LEN):
     lower = (np.minimum(o, c) - l) / safe_o
     rng   = (h - l) / safe_o
 
-    base = np.stack([body, upper, lower, rng], axis=1)  # (n, 4)
+    base = np.stack([body, upper, lower, rng], axis=1)
     n = len(base)
-
     if pattern_len == 1:
         return base
 
@@ -171,15 +161,16 @@ def analyze_forward(entry_idx, o, h, l, c, n, lookahead):
             k = int(hits[0])
             dd = (float(np.min(fut_l[:k + 1])) - entry_price) / entry_price * 100.0
             for D in DD_THRESHOLDS:
-                out[f"hit_{T}_dd{D}"] = dd >= -D
+                if D == 1.0 and STRICT_DD1:
+                    out[f"hit_{T}_dd{D}"] = dd > -1.0   # کاملاً زیر ۱٪
+                else:
+                    out[f"hit_{T}_dd{D}"] = dd >= -D
     return out
 
 
-# ==================== جستجوی مشابه‌ها (با کش) ====================
-def find_similar(target_feat, target_dt_actual, dfs, feats_cache):
+# ==================== جستجوی مشابه (با ماسک پیش‌محاسبه) ====================
+def find_similar(target_feat, target_dt_actual, dfs, feats_cache, static_masks):
     candidates_all = []
-    floor_global = pd.Timestamp(MIN_CANDIDATE_DATE)
-    cap_global   = pd.Timestamp(MAX_CANDIDATE_DATE)
 
     for sym in SYMBOLS:
         df = dfs.get(sym)
@@ -187,22 +178,14 @@ def find_similar(target_feat, target_dt_actual, dfs, feats_cache):
             continue
 
         feats = feats_cache[sym]
-        n = len(df)
-        idx_arr = np.arange(n)
-
-        mask = (df.index >= floor_global) & (df.index < cap_global)
+        valid_idxs = static_masks[sym]
 
         if RESTRICT_CANDIDATES_BEFORE_TARGET:
-            mask = mask & (df.index < target_dt_actual)
+            valid_idxs = valid_idxs[df.index[valid_idxs] < target_dt_actual]
 
         if EXCLUDE_EXACT_TARGET_CANDLE and sym == TARGET_SYMBOL:
-            mask = mask & (df.index != target_dt_actual)
+            valid_idxs = valid_idxs[df.index[valid_idxs] != target_dt_actual]
 
-        mask = mask & (idx_arr >= PATTERN_LEN - 1)
-        mask = mask & (idx_arr <= n - LOOKAHEAD - 2)
-        mask = mask & ~np.isnan(feats).any(axis=1)
-
-        valid_idxs = np.where(mask)[0]
         if len(valid_idxs) == 0:
             continue
 
@@ -257,13 +240,13 @@ def find_similar(target_feat, target_dt_actual, dfs, feats_cache):
 
 # ==================== تحلیل یک کندل مرجع ====================
 def analyze_target_candle(target_idx, df_target, target_feat,
-                          dfs, feats_cache, baseline):
+                          dfs, feats_cache, static_masks, baseline):
     if target_feat is None or np.isnan(target_feat).any():
         return None
 
     target_dt = df_target.index[target_idx]
 
-    candidates = find_similar(target_feat, target_dt, dfs, feats_cache)
+    candidates = find_similar(target_feat, target_dt, dfs, feats_cache, static_masks)
     if len(candidates) < MIN_PATTERNS:
         return None
 
@@ -291,11 +274,20 @@ def analyze_target_candle(target_idx, df_target, target_feat,
     wins = sum(1 for r in results if r["ret"] > 0)
     win_pct = wins / n_res * 100.0
 
+    # 🎯 معیار اصلی: +۴٪ با ریزش زیر ۱٪
+    hit_4_dd1_list = [r for r in results if r.get("hit_4.0_dd1.0", False)]
+    hit_4_dd1 = len(hit_4_dd1_list) / n_res * 100.0
+
+    # معیارهای کمکی
     hit_2_dd1_list = [r for r in results if r.get("hit_2.0_dd1.0", False)]
-    pct_2_dd1 = len(hit_2_dd1_list) / n_res * 100.0
-    base_2_dd1 = baseline.get((2.0, 1.0), 0.0)
-    edge = pct_2_dd1 - base_2_dd1
-    exp_val = pct_2_dd1 * 2.0 - (100.0 - pct_2_dd1) * 1.0
+    hit_2_dd1 = len(hit_2_dd1_list) / n_res * 100.0
+
+    base_4_dd1 = baseline.get((4.0, 1.0), 0.0)
+    edge = hit_4_dd1 - base_4_dd1
+
+    # امید ریاضی برای R/R = 1:4
+    p = hit_4_dd1 / 100.0
+    exp_val = p * 4.0 - (1.0 - p) * 1.0
 
     hit_rates = {}
     for T in TARGETS:
@@ -320,10 +312,12 @@ def analyze_target_candle(target_idx, df_target, target_feat,
         "target_info":    target_info,
         "n_patterns":     n_res,
         "win_pct":        win_pct,
-        "pct_2_dd1":      pct_2_dd1,
+        "hit_4_dd1":      hit_4_dd1,
+        "hit_2_dd1":      hit_2_dd1,
         "edge":           edge,
         "exp_val":        exp_val,
         "hit_rates":      hit_rates,
+        "hit_4_dd1_list": hit_4_dd1_list,
         "hit_2_dd1_list": hit_2_dd1_list,
     }
 
@@ -365,13 +359,13 @@ def build_top_report(top_results, baseline, total_scanned, total_valid):
         return "بدون داده"
 
     lines = []
-    lines.append(f"🏆 <b>۵ کندل برتر {TARGET_SYMBOL} (4h)</b>")
+    lines.append(f"🎯 <b>۵ کندل برتر {TARGET_SYMBOL} برای +۴٪/DD≤۱٪</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"📅 اسکن شده: <code>{total_scanned}</code> کندل | "
                  f"معتبر: <code>{total_valid}</code>")
-    lines.append(f"📊 معیار رتبه‌بندی: <code>{RANK_BY}</code>")
-    lines.append(f"🎯 نرخ پایه +۲٪/DD≤۱٪: "
-                 f"<code>{baseline.get((2.0, 1.0), 0.0):.1f}٪</code>")
+    lines.append(f"📊 معیار رتبه‌بندی: <b>+۴٪ با ریزش زیر ۱٪</b>")
+    lines.append(f"🎯 نرخ پایه +۴٪/DD≤۱٪: "
+                 f"<code>{baseline.get((4.0, 1.0), 0.0):.1f}٪</code>")
     lines.append(f"🔎 Lookahead: <code>{LOOKAHEAD}×4h</code> | "
                  f"ورود: <code>{ENTRY_MODE}</code>")
     lines.append("")
@@ -380,6 +374,7 @@ def build_top_report(top_results, baseline, total_scanned, total_valid):
         ti = r["target_info"]
         d = ti["date"]
         date_s = d.strftime("%Y-%m-%d %H:%M (%a)")
+
         lines.append(f"<b>#{rank} — {date_s}</b>")
         lines.append(f"   O=<code>{ti['o']:.4f}</code> "
                      f"H=<code>{ti['h']:.4f}</code> "
@@ -391,12 +386,30 @@ def build_top_report(top_results, baseline, total_scanned, total_valid):
                      f"دامنه <code>{ti['rng']*100:.2f}٪</code>")
         lines.append(f"   الگو: <code>{r['n_patterns']}</code> | "
                      f"سوددهی: <code>{r['win_pct']:.1f}٪</code>")
-        lines.append(f"   🎯 +۲٪/DD≤۱٪: <code>{r['pct_2_dd1']:.1f}٪</code> "
-                     f"(edge <code>{r['edge']:+.1f}٪</code>) | "
-                     f"امید <code>{r['exp_val']:+.1f}٪</code>")
+
+        lines.append(
+            f"   🎯 <b>+۴٪/DD≤۱٪: <code>{r['hit_4_dd1']:.1f}٪</code></b> "
+            f"(پایه <code>{baseline.get((4.0,1.0),0):.1f}٪</code> | "
+            f"edge <code>{r['edge']:+.1f}٪</code>) "
+            f"| امید <code>{r['exp_val']:+.2f}٪</code>"
+        )
+
         hr = r["hit_rates"]
-        lines.append(f"   +۲۰٪/DD≤۲٪: <code>{hr.get((20.0,2.0),0):.1f}٪</code> | "
-                     f"+۵۰٪/DD≤۳٪: <code>{hr.get((50.0,3.0),0):.1f}٪</code>")
+        lines.append(
+            f"   +۲٪/DD≤۱٪: <code>{hr.get((2.0,1.0),0):.1f}٪</code> | "
+            f"+۴٪/DD≤۲٪: <code>{hr.get((4.0,2.0),0):.1f}٪</code> | "
+            f"+۲۰٪/DD≤۲٪: <code>{hr.get((20.0,2.0),0):.1f}٪</code>"
+        )
+
+        if r["hit_4_dd1_list"]:
+            lines.append(f"   ✅ موارد موفق +۴٪/DD≤۱٪:")
+            for m in r["hit_4_dd1_list"][:5]:
+                lines.append(f"      • <b>{m['symbol']}</b> @ "
+                             f"{m['date'].strftime('%Y-%m-%d %H:%M')}")
+            if len(r["hit_4_dd1_list"]) > 5:
+                lines.append(f"      • ... و "
+                             f"{len(r['hit_4_dd1_list']) - 5} مورد دیگر")
+
         lines.append("")
 
     return "\n".join(lines).rstrip()
@@ -406,10 +419,12 @@ def build_top_report(top_results, baseline, total_scanned, total_valid):
 def main():
     log("=" * 60)
     log(f"🚀 اسکن همه‌ی کندل‌های 4h {TARGET_SYMBOL} | ورود={ENTRY_MODE}")
-    log(f"   بازه‌ی دریافت: {SEARCH_PERIOD} | اینتروال خام: {INTERVAL_SRC}")
-    log(f"   بازه‌ی کاندیدها: {MIN_CANDIDATE_DATE} → {MAX_CANDIDATE_DATE}")
+    log(f"   بازه: {SEARCH_PERIOD} | اینتروال: {INTERVAL_SRC} → {RESAMPLE_RULE}")
+    log(f"   کاندیدها: {MIN_CANDIDATE_DATE} → {MAX_CANDIDATE_DATE}")
     log(f"   TOP_N={TOP_N_TO_SEND} | RANK_BY={RANK_BY} | "
         f"MAX_SCAN={MAX_TARGETS_TO_SCAN}")
+    log(f"   STRICT_DD1={STRICT_DD1} | "
+        f"RESTRICT_BEFORE_TARGET={RESTRICT_CANDIDATES_BEFORE_TARGET}")
     log("=" * 60)
 
     if pd.Timestamp(MIN_CANDIDATE_DATE) >= pd.Timestamp(MAX_CANDIDATE_DATE):
@@ -432,10 +447,26 @@ def main():
     feats_cache = {}
     for sym, df in dfs.items():
         feats_cache[sym] = build_feature_matrix(df, PATTERN_LEN)
-        log(f"   ↳ {sym}: features {feats_cache[sym].shape}")
+        log(f"   ↳ {sym}: {feats_cache[sym].shape}")
 
-    # ۳) نرخ پایه
-    log("\n📊 محاسبه‌ی نرخ پایه (4h)...")
+    # ۳) پیش‌محاسبه‌ی ماسک‌های ثابت (سرعت)
+    log("\n🔧 پیش‌محاسبه‌ی ماسک‌های ثابت...")
+    floor_global = pd.Timestamp(MIN_CANDIDATE_DATE)
+    cap_global   = pd.Timestamp(MAX_CANDIDATE_DATE)
+    static_masks = {}
+    for sym, df in dfs.items():
+        feats = feats_cache[sym]
+        n = len(df)
+        idx_arr = np.arange(n)
+        mask = (df.index >= floor_global) & (df.index < cap_global)
+        mask &= (idx_arr >= PATTERN_LEN - 1)
+        mask &= (idx_arr <= n - LOOKAHEAD - 2)
+        mask &= ~np.isnan(feats).any(axis=1)
+        static_masks[sym] = np.where(mask)[0]
+        log(f"   ↳ {sym}: {len(static_masks[sym])} کندل معتبر")
+
+    # ۴) نرخ پایه
+    log("\n📊 محاسبه‌ی نرخ پایه...")
     all_outcomes = []
     for sym, df in dfs.items():
         o = df["Open"].values.astype(float)
@@ -461,8 +492,9 @@ def main():
 
     log(f"   نمونه: {n_base} | سوددهی پایه: {baseline['win']:.2f}٪")
     log(f"   +۲٪/DD≤۱٪ پایه: {baseline[(2.0, 1.0)]:.2f}٪")
+    log(f"   +۴٪/DD≤۱٪ پایه: {baseline[(4.0, 1.0)]:.2f}٪")
 
-    # ۴) اسکن همه‌ی کندل‌های TARGET_SYMBOL (از جدید به قدیم)
+    # ۵) اسکن همه‌ی کندل‌های TARGET_SYMBOL (از جدید به قدیم)
     df_target    = dfs[TARGET_SYMBOL]
     target_feats = feats_cache[TARGET_SYMBOL]
     n_t          = len(df_target)
@@ -470,42 +502,41 @@ def main():
     valid_target_idxs = list(range(PATTERN_LEN - 1, n_t))[::-1]
     valid_target_idxs = [i for i in valid_target_idxs
                          if not np.isnan(target_feats[i]).any()]
-
     if MAX_TARGETS_TO_SCAN is not None:
         valid_target_idxs = valid_target_idxs[:MAX_TARGETS_TO_SCAN]
 
     total_targets = len(valid_target_idxs)
-    log(f"\n🔍 اسکن {total_targets} کندل مرجع از {TARGET_SYMBOL}...")
+    log(f"\n🔍 اسکن {total_targets} کندل مرجع...")
 
     all_results = []
     for k, idx in enumerate(valid_target_idxs):
         try:
             res = analyze_target_candle(
                 idx, df_target, target_feats[idx],
-                dfs, feats_cache, baseline
+                dfs, feats_cache, static_masks, baseline
             )
             if res:
                 all_results.append(res)
         except Exception as e:
             log(f"   ⚠️ خطا idx={idx}: {e}")
 
-        if (k + 1) % 100 == 0:
-            log(f"   پیشرفت: {k+1}/{total_targets} | "
-                f"معتبر: {len(all_results)}")
+        if (k + 1) % 500 == 0:
+            log(f"   پیشرفت: {k+1}/{total_targets} | معتبر: {len(all_results)}")
 
     log(f"✅ تحلیل کامل شد: {len(all_results)} کندل معتبر")
 
     if not all_results:
         raise RuntimeError("هیچ کندل معتبری یافت نشد.")
 
-    # ۵) رتبه‌بندی
-    if RANK_BY not in ("exp_val", "edge", "pct_2_dd1", "win_pct"):
+    # ۶) رتبه‌بندی
+    valid_rank_keys = ("hit_4_dd1", "hit_2_dd1", "exp_val", "edge", "win_pct")
+    if RANK_BY not in valid_rank_keys:
         raise RuntimeError(f"RANK_BY نامعتبر: {RANK_BY}")
 
     all_results.sort(key=lambda x: x[RANK_BY], reverse=True)
     top5 = all_results[:TOP_N_TO_SEND]
 
-    # ۶) گزارش و ارسال
+    # ۷) گزارش و ارسال
     report = build_top_report(top5, baseline, total_targets, len(all_results))
     plain = (report.replace("<b>", "").replace("</b>", "")
                    .replace("<code>", "").replace("</code>", ""))
