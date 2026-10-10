@@ -38,10 +38,15 @@ EXCLUDE_TEMPORAL = 4             # حذف همسایه‌ی هم‌نماد با
 DEDUP_DIST       = 0.01
 TOP_PATTERNS     = 25
 
+# نحوه‌ی هفته‌بندی (برای هم‌راستایی با TradingView)
+# "MON" → دوشنبه تا یکشنبه (پیش‌فرض TradingView کریپتو)
+# "SUN" → یکشنبه تا شنبه
+WEEK_START = "MON"
+
 
 # ==================== توابع ====================
 def fetch_weekly(symbol):
-    log(f"📥 دریافت {symbol} (1d→1wk)")
+    log(f"📥 دریافت {symbol} (1d→1wk, شروع هفته={WEEK_START})")
     try:
         df = yf.download(symbol, interval="1d", period=SEARCH_PERIOD_DAILY,
                          progress=False, auto_adjust=True, timeout=60)
@@ -52,12 +57,22 @@ def fetch_weekly(symbol):
         df = df[['Open', 'High', 'Low', 'Close']].dropna()
         if df.empty:
             return None
-        df_wk = df.resample('W-FRI').agg({
+
+        # هفته‌بندی با برچسب = شروع هفته
+        # W-SUN → دوره = دوشنبه..یکشنبه، برچسب چپ = دوشنبه
+        # W-SAT → دوره = یکشنبه..شنبه، برچسب چپ = یکشنبه
+        if WEEK_START == "MON":
+            rule = 'W-SUN'
+        else:
+            rule = 'W-SAT'
+
+        df_wk = df.resample(rule, label='left', closed='left').agg({
             'Open':  'first',
             'High':  'max',
             'Low':   'min',
             'Close': 'last',
         }).dropna()
+
         return df_wk if not df_wk.empty else None
     except Exception as e:
         log(f"❌ fetch_weekly {symbol}: {e}")
@@ -145,6 +160,8 @@ def build_report(results, baseline, win_base, scan_stats):
     lines = []
     lines.append("🔍 <b>اسکن الگوهای کندلی هفتگی (KDTree)</b>")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📅 شروع هفته: <code>{WEEK_START}</code> | "
+                 f"Lookahead: <code>{LOOKAHEAD}w</code>")
     lines.append(f"🎯 اهداف: <code>{', '.join(f'+{T:.0f}٪' for T in TARGETS)}</code>")
     lines.append(f"📉 ریزش‌های مجاز: "
                  f"<code>{', '.join(f'{D:.0f}٪' for D in DD_THRESHOLDS)}</code>")
@@ -207,6 +224,8 @@ def main():
         df = fetch_weekly(sym)
         if df is not None and len(df) > LOOKAHEAD + 10:
             dfs[sym] = df
+            log(f"   ✅ {sym}: {len(df)} کندل هفتگی | "
+                f"{df.index[0].date()} → {df.index[-1].date()}")
 
     missing = [s for s in SYMBOLS if s not in dfs]
     if missing:
@@ -336,14 +355,15 @@ def main():
 
     log(f"🏆 الگوهای یکتای نهایی: {len(picked)}")
 
-    # ۷) افزودن تاریخ
+    # ۷) افزودن تاریخ (برچسب = شروع هفته، مثل TradingView)
     results = []
     for r in picked:
         sym = r['symbol']
         dt = symbol_index[sym][r['candle_idx']]
         if getattr(dt, 'tz', None) is not None:
             dt = dt.tz_localize(None)
-        r['date'] = dt.strftime('%Y-%m-%d')
+        # فرمت: YYYY-MM-DD (Mon) — قابل مقایسه مستقیم با TradingView
+        r['date'] = dt.strftime('%Y-%m-%d (%a)')
         results.append(r)
         log(f"  ✅ {sym} @ {r['date']} | "
             f"win={r['win_rate']:.1f}٪ | "
