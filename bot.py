@@ -49,10 +49,6 @@ def safe_float(v):
         return 0.0
 
 
-def short_addr(addr):
-    return f"{addr[:6]}...{addr[-4:]}" if len(addr) > 12 else addr
-
-
 def roi_str(roi):
     pct = roi * 100 if abs(roi) < 10 else roi
     return f"{pct:,.1f}%"
@@ -68,7 +64,6 @@ def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
         addr = row.get("ethAddress") or row.get("address") or "?"
         candidates.append({
             "address": addr,
-            "short": short_addr(addr),
             "month_roi": get_perf(row, "month", "roi"),
             "month_pnl": get_perf(row, "month", "pnl"),
             "all_roi": get_perf(row, "allTime", "roi"),
@@ -88,7 +83,7 @@ def build_message(records):
     lines = [header]
     for i, r in enumerate(records, 1):
         lines.append(
-            f"{i}. {r['short']}\n"
+            f"{i}. {r['address']}\n"
             f"   📅 {roi_str(r['month_roi'])} (${r['month_pnl']:,.0f})\n"
             f"   🏆 {roi_str(r['all_roi'])} (${r['all_pnl']:,.0f})\n"
         )
