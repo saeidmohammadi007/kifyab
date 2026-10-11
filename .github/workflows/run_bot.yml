@@ -1,7 +1,7 @@
 name: Send Top 10 Traders to Telegram
 
 on:
-  workflow_dispatch:  # فقط اجرای دستی از تب Actions
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -25,15 +25,8 @@ jobs:
             pip install requests
           fi
 
-      - name: Debug - list files
-        run: |
-          echo "--- working dir ---"
-          pwd
-          echo "--- files ---"
-          ls -la
-
       - name: Run bot script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+        run: python bot.py
