@@ -10,8 +10,8 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 
 LIMIT = 200
 MIN_ACCOUNT_VALUE = 100  # حداقل موجودی ۱۰۰ دلار
-FILLS_HOURS = 4  # بازه معاملات اخیر (ساعت)
-SLEEP_BETWEEN_REQUESTS = 0.25  # مکث بین درخواست‌ها برای جلوگیری از rate limit
+FILLS_HOURS = 1  # بازه معاملات اخیر (۱ ساعت)
+SLEEP_BETWEEN_REQUESTS = 0.3  # مکث بین درخواست‌ها برای جلوگیری از rate limit
 
 
 # ============================================================
@@ -164,9 +164,11 @@ def format_positions(positions_data, recent_fills):
 
         if coin in new_coins:
             nc = new_coins[coin]
-            mins_ago = int((time.time() * 1000 - nc["time"]) / 60000)
+            secs_ago = int((time.time() * 1000 - nc["time"]) / 1000)
+            mins_ago = secs_ago // 60
+            remaining_secs = secs_ago % 60
             line += (
-                f"\n      ⏱️ باز شده در: {mins_ago} دقیقه پیش\n"
+                f"\n      ⏱️ باز شده در: {mins_ago} دقیقه و {remaining_secs} ثانیه پیش\n"
                 f"      📝 نوع: {nc['dir']} | 💲 قیمت: ${nc['px']:,.4f} | 📦 حجم: {nc['sz']:,.4f}"
             )
 
