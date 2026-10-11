@@ -6,13 +6,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 
-WINDOW_LABELS = {
-    "day": "۲۴ ساعت گذشته",
-    "week": "۷ روز گذشته",
-    "month": "۳۰ روز گذشته",
-    "allTime": "کل دوره",
-}
-
 LIMIT = 100
 MIN_ACCOUNT_VALUE = 100  # حداقل موجودی ۱۰۰ دلار
 
@@ -56,52 +49,50 @@ def safe_float(v):
         return 0.0
 
 
-def top_traders_by_roi(rows, window, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
-    """۱۰۰ تریدر برتر بر اساس درصد سود (ROI)"""
+def short_addr(addr):
+    return f"{addr[:6]}...{addr[-4:]}" if len(addr) > 12 else addr
+
+
+def roi_str(roi):
+    pct = roi * 100 if abs(roi) < 10 else roi
+    return f"{pct:,.1f}%"
+
+
+def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
+    """۱۰۰ کیف پول برتر بر اساس ROI کل دوره"""
     candidates = []
     for row in rows:
         acc = safe_float(row.get("accountValue", 0))
         if acc < min_account:
             continue
-        roi = get_perf(row, window, "roi")
-        pnl = get_perf(row, window, "pnl")
+        addr = row.get("ethAddress") or row.get("address") or "?"
         candidates.append({
-            "address": row.get("ethAddress") or row.get("address") or "?",
-            "roi": roi,
-            "pnl": pnl,
-            "accountValue": acc,
+            "address": addr,
+            "short": short_addr(addr),
+            "month_roi": get_perf(row, "month", "roi"),
+            "month_pnl": get_perf(row, "month", "pnl"),
+            "all_roi": get_perf(row, "allTime", "roi"),
+            "all_pnl": get_perf(row, "allTime", "pnl"),
         })
 
-    candidates.sort(key=lambda x: x["roi"], reverse=True)
+    candidates.sort(key=lambda x: x["all_roi"], reverse=True)
     return candidates[:limit]
 
 
-def format_section(title, traders):
-    if not traders:
-        return f"📊 *{title}*\n⚠️ داده‌ای موجود نیست.\n\n"
-
-    msg = f"📊 *{title}* — بر اساس درصد سود\n"
-    for i, t in enumerate(traders, 1):
-        addr = t["address"]
-        short = f"{addr[:6]}...{addr[-4:]}" if len(addr) > 12 else addr
-        roi = t["roi"]
-        roi_pct = roi * 100 if abs(roi) < 10 else roi
-        pnl = t["pnl"]
-        msg += (
-            f"{i}. {short} | "
-            f"📈 {roi_pct:,.1f}% | "
-            f"💰 ${pnl:,.0f}\n"
+def build_message(records):
+    header = (
+        "🏆 ۱۰۰ کیف پول برتر Hyperliquid (کل دوره)\n"
+        "📅 ماهانه | 🏆 کل دوره\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    lines = [header]
+    for i, r in enumerate(records, 1):
+        lines.append(
+            f"{i}. {r['short']}\n"
+            f"   📅 {roi_str(r['month_roi'])} (${r['month_pnl']:,.0f})\n"
+            f"   🏆 {roi_str(r['all_roi'])} (${r['all_pnl']:,.0f})\n"
         )
-    return msg + "\n"
-
-
-def build_message(rows):
-    parts = [f"🏆 {LIMIT} معامله‌گر برتر Hyperliquid (بر اساس درصد سود)\n\n"]
-    for window in ["month", "allTime"]:
-        title = WINDOW_LABELS[window]
-        traders = top_traders_by_roi(rows, window, limit=LIMIT)
-        parts.append(format_section(title, traders))
-    return "".join(parts)
+    return "".join(lines)
 
 
 def send_telegram(message):
@@ -130,7 +121,9 @@ def main():
     if not rows:
         send_telegram("⚠️ دریافت داده از Hyperliquid ناموفق بود.")
         return
-    message = build_message(rows)
+    top = top_by_alltime(rows)
+    print(f"تعداد کیف پول در گزارش: {len(top)}")
+    message = build_message(top)
     send_telegram(message)
 
 
