@@ -8,7 +8,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO_URL = "https://api.hyperliquid.xyz/info"
 
-LIMIT = 100
+LIMIT = 200
 MIN_ACCOUNT_VALUE = 100  # حداقل موجودی ۱۰۰ دلار
 FILLS_HOURS = 24  # بازه معاملات اخیر (ساعت)
 SLEEP_BETWEEN_REQUESTS = 0.25  # مکث بین درخواست‌ها برای جلوگیری از rate limit
@@ -96,6 +96,13 @@ def roi_str(roi):
     return f"{pct:,.1f}%"
 
 
+def has_open_positions(positions_data):
+    """بررسی اینکه آیا کیف پول پوزیشن باز دارد یا نه"""
+    if not positions_data:
+        return False
+    return len(positions_data.get("assetPositions", [])) > 0
+
+
 def format_positions(positions_data, recent_fills):
     """فرمت‌دهی پوزیشن‌های باز با علامت‌گذاری معاملات جدید"""
     asset_positions = positions_data.get("assetPositions", [])
@@ -145,7 +152,7 @@ def format_positions(positions_data, recent_fills):
 #                       انتخاب برترین‌ها
 # ============================================================
 def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
-    """۱۰۰ کیف پول برتر بر اساس ROI کل دوره"""
+    """N کیف پول برتر بر اساس ROI کل دوره"""
     candidates = []
     for row in rows:
         acc = safe_float(row.get("accountValue", 0))
@@ -169,8 +176,8 @@ def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
 # ============================================================
 def build_message(records, positions_map, fills_map):
     header = (
-        "🏆 ۱۰۰ کیف پول برتر Hyperliquid (کل دوره)\n"
-        "📅 ماهانه | 🏆 کل دوره | 📌 پوزیشن‌های باز ۲۴ ساعته\n"
+        f"🏆 {len(records)} کیف پول برتر Hyperliquid با پوزیشن باز\n"
+        f"📅 ماهانه | 🏆 کل دوره | 📌 پوزیشن‌های باز {FILLS_HOURS} ساعته\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     lines = [header]
@@ -222,21 +229,39 @@ def main():
         return
 
     top = top_by_alltime(rows)
-    print(f"تعداد کیف پول در گزارش: {len(top)}")
+    print(f"تعداد کیف پول در لیست اولیه: {len(top)}")
 
     positions_map = {}
     fills_map = {}
+    filtered = []
+
     for idx, r in enumerate(top, 1):
         addr = r["address"]
         if not addr or addr == "?":
             continue
-        print(f"[{idx}/{len(top)}] دریافت داده {addr}")
-        positions_map[addr] = fetch_positions(addr)
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-        fills_map[addr] = fetch_recent_fills(addr, hours=FILLS_HOURS)
+
+        print(f"[{idx}/{len(top)}] بررسی {addr}")
+        positions = fetch_positions(addr)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-    message = build_message(top, positions_map, fills_map)
+        # فیلتر: فقط کیف پول‌هایی که پوزیشن باز دارند
+        if not has_open_positions(positions):
+            continue
+
+        fills = fetch_recent_fills(addr, hours=FILLS_HOURS)
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+        positions_map[addr] = positions
+        fills_map[addr] = fills
+        filtered.append(r)
+
+    print(f"تعداد کیف پول با پوزیشن باز: {len(filtered)}")
+
+    if not filtered:
+        send_telegram("⚠️ هیچ کیف پولی با پوزیشن باز پیدا نشد.")
+        return
+
+    message = build_message(filtered, positions_map, fills_map)
     send_telegram(message)
 
 
