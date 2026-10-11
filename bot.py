@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -7,8 +6,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 
+WINDOW_LABELS = {
+    "day": "۲۴ ساعت گذشته",
+    "week": "۷ روز گذشته",
+    "month": "۳۰ روز گذشته",
+    "allTime": "کل دوره",
+}
 
-def fetch_top_traders(limit=10, window="allTime", debug=False):
+LIMIT = 100
+MIN_ACCOUNT_VALUE = 100  # حداقل موجودی ۱۰۰ دلار
+
+
+def fetch_rows():
     try:
         r = requests.get(LEADERBOARD_URL, timeout=60)
         r.raise_for_status()
@@ -17,88 +26,82 @@ def fetch_top_traders(limit=10, window="allTime", debug=False):
         print(f"خطا در دریافت داده: {e}")
         return []
 
-    # چند کلید ممکن را امتحان کن
     if isinstance(data, list):
-        rows = data
-    elif isinstance(data, dict):
-        rows = (
+        return data
+    if isinstance(data, dict):
+        return (
             data.get("leaderboardRows")
             or data.get("leaderboard")
             or data.get("rows")
             or []
         )
-    else:
-        rows = []
+    return []
 
-    if debug:
-        print("--- نوع داده:", type(data).__name__)
-        if isinstance(data, dict):
-            print("--- کلیدها:", list(data.keys()))
-        print("--- تعداد ردیف:", len(rows))
-        if rows:
-            print("--- نمونه ردیف اول:")
-            print(json.dumps(rows[0], indent=2, ensure_ascii=False)[:1500])
 
-    if not rows:
-        print("داده‌ای در پاسخ وجود ندارد.")
-        return []
+def get_perf(row, window, key):
+    perfs = row.get("windowPerformances") or []
+    for perf in perfs:
+        if isinstance(perf, list) and len(perf) == 2 and perf[0] == window:
+            try:
+                return float(perf[1].get(key, 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
-    def get_perf(row, key):
-        perfs = row.get("windowPerformances") or []
-        for perf in perfs:
-            if isinstance(perf, list) and len(perf) == 2 and perf[0] == window:
-                val = perf[1].get(key, 0)
-                try:
-                    return float(val)
-                except (TypeError, ValueError):
-                    return 0.0
+
+def safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
         return 0.0
 
-    def safe_float(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
 
-    sorted_rows = sorted(rows, key=lambda r: get_perf(r, "pnl"), reverse=True)[:limit]
-
-    result = []
-    for row in sorted_rows:
-        result.append({
+def top_traders_by_roi(rows, window, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
+    """۱۰۰ تریدر برتر بر اساس درصد سود (ROI)"""
+    candidates = []
+    for row in rows:
+        acc = safe_float(row.get("accountValue", 0))
+        if acc < min_account:
+            continue
+        roi = get_perf(row, window, "roi")
+        pnl = get_perf(row, window, "pnl")
+        candidates.append({
             "address": row.get("ethAddress") or row.get("address") or "?",
-            "pnl": get_perf(row, "pnl"),
-            "roi": get_perf(row, "roi"),
-            "accountValue": safe_float(row.get("accountValue", 0)),
+            "roi": roi,
+            "pnl": pnl,
+            "accountValue": acc,
         })
-    return result
+
+    candidates.sort(key=lambda x: x["roi"], reverse=True)
+    return candidates[:limit]
 
 
-def format_message(traders, window="allTime"):
+def format_section(title, traders):
     if not traders:
-        return "⚠️ داده‌ای برای نمایش یافت نشد."
+        return f"📊 *{title}*\n⚠️ داده‌ای موجود نیست.\n\n"
 
-    labels = {
-        "day": "۲۴ ساعت گذشته",
-        "week": "هفته گذشته",
-        "month": "ماه گذشته",
-        "allTime": "کل دوره",
-    }
-    title = labels.get(window, window)
-
-    msg = f"🏆 ۱۰ معامله‌گر برتر Hyperliquid ({title})\n\n"
+    msg = f"📊 *{title}* — بر اساس درصد سود\n"
     for i, t in enumerate(traders, 1):
         addr = t["address"]
         short = f"{addr[:6]}...{addr[-4:]}" if len(addr) > 12 else addr
-        pnl = t["pnl"]
         roi = t["roi"]
         roi_pct = roi * 100 if abs(roi) < 10 else roi
+        pnl = t["pnl"]
         msg += (
-            f"{i}. {short}\n"
-            f"   💰 سود: ${pnl:,.0f}\n"
-            f"   📈 بازدهی: {roi_pct:,.1f}%\n"
-            f"   🏦 موجودی: ${t['accountValue']:,.0f}\n\n"
+            f"{i}. {short} | "
+            f"📈 {roi_pct:,.1f}% | "
+            f"💰 ${pnl:,.0f}\n"
         )
-    return msg
+    return msg + "\n"
+
+
+def build_message(rows):
+    parts = [f"🏆 {LIMIT} معامله‌گر برتر Hyperliquid (بر اساس درصد سود)\n\n"]
+    for window in ["month", "allTime"]:
+        title = WINDOW_LABELS[window]
+        traders = top_traders_by_roi(rows, window, limit=LIMIT)
+        parts.append(format_section(title, traders))
+    return "".join(parts)
 
 
 def send_telegram(message):
@@ -107,22 +110,27 @@ def send_telegram(message):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        res = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True,
-        }, timeout=30)
-        res.raise_for_status()
-        print("✅ پیام با موفقیت ارسال شد.")
-    except Exception as e:
-        print(f"خطا در ارسال پیام: {e}")
+    chunks = [message[i:i + 4000] for i in range(0, len(message), 4000)]
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, 1):
+        try:
+            res = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "disable_web_page_preview": True,
+            }, timeout=30)
+            res.raise_for_status()
+            print(f"✅ بخش {idx}/{total} ارسال شد.")
+        except Exception as e:
+            print(f"خطا در ارسال بخش {idx}: {e}")
 
 
 def main():
-    window = "allTime"  # "day" | "week" | "month" | "allTime"
-    traders = fetch_top_traders(limit=10, window=window, debug=True)
-    message = format_message(traders, window=window)
+    rows = fetch_rows()
+    if not rows:
+        send_telegram("⚠️ دریافت داده از Hyperliquid ناموفق بود.")
+        return
+    message = build_message(rows)
     send_telegram(message)
 
 
