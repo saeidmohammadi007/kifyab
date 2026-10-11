@@ -107,7 +107,41 @@ def safe_float(v):
 
 def roi_str(roi):
     pct = roi * 100 if abs(roi) < 10 else roi
-    return f"{pct:,.1f}%"
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:,.1f}%"
+
+
+def pnl_str(pnl):
+    sign = "+" if pnl >= 0 else ""
+    return f"{sign}${pnl:,.0f}"
+
+
+def short_addr(addr, n=8):
+    """کوتاه کردن آدرس برای نمایش تمیزتر"""
+    if not addr or len(addr) < 14:
+        return addr
+    return f"{addr[:n]}...{addr[-4:]}"
+
+
+def fmt_price(px):
+    """فرمت قیمت بر اساس بزرگی عدد"""
+    if px == 0:
+        return "$0"
+    if px >= 1000:
+        return f"${px:,.2f}"
+    if px >= 1:
+        return f"${px:,.4f}"
+    return f"${px:,.6f}"
+
+
+def fmt_time_ago(ms_time):
+    """نمایش زمان به صورت خوانا"""
+    secs_ago = int((time.time() * 1000 - ms_time) / 1000)
+    if secs_ago < 60:
+        return f"{secs_ago} ثانیه پیش"
+    if secs_ago < 3600:
+        return f"{secs_ago // 60} دقیقه پیش"
+    return f"{secs_ago // 3600} ساعت پیش"
 
 
 def extract_new_coins(recent_fills):
@@ -117,7 +151,6 @@ def extract_new_coins(recent_fills):
         dir_ = fill.get("dir", "")
         coin = fill.get("coin", "")
 
-        # فقط معاملات باز کردن پوزیشن
         if dir_.startswith("Open"):
             if coin not in new_coins or fill.get("time", 0) > new_coins[coin]["time"]:
                 new_coins[coin] = {
@@ -151,7 +184,6 @@ def extract_take_profits(open_orders, coin):
             continue
 
         order_type = str(order.get("orderType", ""))
-        # تشخیص سفارش حد سود
         is_tp = (
             "Take Profit" in order_type
             or order.get("triggerCondition") == "tp"
@@ -160,11 +192,7 @@ def extract_take_profits(open_orders, coin):
         if not is_tp:
             continue
 
-        trigger_px = (
-            order.get("triggerPx")
-            or order.get("triggerPrice")
-            or order.get("isTrigger") and order.get("triggerPx")
-        )
+        trigger_px = order.get("triggerPx") or order.get("triggerPrice")
         if not trigger_px:
             continue
 
@@ -174,72 +202,107 @@ def extract_take_profits(open_orders, coin):
             "is_market": bool(order.get("isMarket", False)),
         })
 
-    # مرتب‌سازی بر اساس قیمت
     tps.sort(key=lambda x: x["px"])
     return tps
 
 
+def _format_single_position(pos, new_coins, open_orders, is_last=False, show_time=False):
+    """فرمت‌دهی یک پوزیشن به صورت درخت‌نما"""
+    p = pos.get("position", {})
+    coin = p.get("coin", "?")
+    szi = safe_float(p.get("szi", 0))
+    entry_px = safe_float(p.get("entryPx", 0))
+    pos_value = safe_float(p.get("positionValue", 0))
+    unrealized_pnl = safe_float(p.get("unrealizedPnl", 0))
+    margin_used = safe_float(p.get("marginUsed", 0))
+    liq_px = p.get("liquidationPx")
+    leverage = p.get("leverage", {}) or {}
+    lev_value = leverage.get("value", "?")
+    lev_type = leverage.get("type", "cross")
+
+    side_icon = "🟢" if szi > 0 else "🔴"
+    side_txt = "LONG" if szi > 0 else "SHORT"
+
+    roe = p.get("returnOnEquity")
+    roe_val = safe_float(roe) * 100 if roe else 0
+    pnl_icon = "📈" if unrealized_pnl >= 0 else "📉"
+
+    prefix = "   └ " if is_last else "   ├ "
+    cont = "      " if is_last else "   │  "
+
+    lines = []
+    lines.append(f"{prefix}{side_icon} {coin} · {side_txt} · {lev_value}x {lev_type}\n")
+    lines.append(f"{cont}💰 ارزش: ${pos_value:,.0f}  |  📊 حجم: {abs(szi):,.4f}\n")
+    lines.append(f"{cont}📈 ورود: {fmt_price(entry_px)}\n")
+
+    pnl_sign = "+" if unrealized_pnl >= 0 else ""
+    lines.append(
+        f"{cont}{pnl_icon} سود/زیان: {pnl_sign}${unrealized_pnl:,.0f} ({roe_val:+.1f}%)\n"
+    )
+
+    liq_txt = f"  |  ⚠️ لیکویید: {fmt_price(safe_float(liq_px))}" if liq_px else ""
+    lines.append(f"{cont}🛡️ مارجین: ${margin_used:,.0f}{liq_txt}\n")
+
+    # حد سود
+    take_profits = extract_take_profits(open_orders, coin)
+    if take_profits:
+        tp_parts = []
+        for tp in take_profits:
+            tp_type = "بازار" if tp["is_market"] else "لیمیت"
+            tp_parts.append(f"{fmt_price(tp['px'])} ({tp_type})")
+        lines.append(f"{cont}🎯 حد سود: {' | '.join(tp_parts)}\n")
+
+    # اطلاعات زمان باز شدن (فقط برای پوزیشن‌های جدید)
+    if show_time and coin in new_coins:
+        nc = new_coins[coin]
+        lines.append(
+            f"{cont}⏱️ باز شده: {fmt_time_ago(nc['time'])}\n"
+            f"{cont}📝 {nc['dir']} · {fmt_price(nc['px'])} · {nc['sz']:,.4f}\n"
+        )
+
+    return "".join(lines)
+
+
 def format_positions(positions_data, recent_fills):
-    """فرمت‌دهی پوزیشن‌های باز با علامت‌گذاری معاملات جدید و نمایش حد سود"""
+    """فرمت‌دهی تمیز پوزیشن‌ها با تفکیک جدید/قبلی"""
     asset_positions = positions_data.get("assetPositions", [])
     if not asset_positions:
-        return "   🔹 پوزیشن بازی ندارد\n"
+        return "   └ هیچ پوزیشن بازی ندارد\n"
 
     new_coins = extract_new_coins(recent_fills)
     open_orders = positions_data.get("openOrders", []) or []
 
-    lines = []
+    # جداسازی پوزیشن‌های جدید از قدیمی
+    new_positions = []
+    old_positions = []
     for pos in asset_positions:
-        p = pos.get("position", {})
-        coin = p.get("coin", "?")
-        szi = safe_float(p.get("szi", 0))
-        entry_px = safe_float(p.get("entryPx", 0))
-        pos_value = safe_float(p.get("positionValue", 0))
-        unrealized_pnl = safe_float(p.get("unrealizedPnl", 0))
-        margin_used = safe_float(p.get("marginUsed", 0))
-        liq_px = p.get("liquidationPx")
-        leverage = p.get("leverage", {}) or {}
-        lev_value = leverage.get("value", "?")
-        lev_type = leverage.get("type", "cross")
-
-        side = "🟢 LONG" if szi > 0 else "🔴 SHORT"
-        is_new = "🆕 " if coin in new_coins else ""
-
-        roe = p.get("returnOnEquity")
-        roe_str = f"{safe_float(roe) * 100:,.1f}%" if roe else "N/A"
-
-        line = (
-            f"   {is_new}{side} {coin}\n"
-            f"      📊 حجم: {abs(szi):,.4f} | 💰 ارزش: ${pos_value:,.0f}\n"
-            f"      🎯 اهرم: {lev_value}x ({lev_type})\n"
-            f"      📈 ورود: ${entry_px:,.4f} | 💵 سود/زیان: ${unrealized_pnl:,.0f} ({roe_str})\n"
-            f"      🛡️ مارجین: ${margin_used:,.0f}"
-        )
-        if liq_px:
-            line += f" | ⚠️ لیکویید: ${safe_float(liq_px):,.4f}"
-
-        # افزودن حد سود
-        take_profits = extract_take_profits(open_orders, coin)
-        if take_profits:
-            tp_parts = []
-            for tp in take_profits:
-                tp_type = "بازار" if tp["is_market"] else "لیمیت"
-                tp_parts.append(f"${tp['px']:,.4f} ({tp_type})")
-            line += f"\n      🎯 حد سود: {' | '.join(tp_parts)}"
-
+        coin = pos.get("position", {}).get("coin", "")
         if coin in new_coins:
-            nc = new_coins[coin]
-            secs_ago = int((time.time() * 1000 - nc["time"]) / 1000)
-            mins_ago = secs_ago // 60
-            remaining_secs = secs_ago % 60
-            line += (
-                f"\n      ⏱️ باز شده در: {mins_ago} دقیقه و {remaining_secs} ثانیه پیش\n"
-                f"      📝 نوع: {nc['dir']} | 💲 قیمت: ${nc['px']:,.4f} | 📦 حجم: {nc['sz']:,.4f}"
-            )
+            new_positions.append(pos)
+        else:
+            old_positions.append(pos)
 
-        lines.append(line)
+    lines = []
 
-    return "\n".join(lines) + "\n"
+    # پوزیشن‌های جدید
+    if new_positions:
+        lines.append("   🆕 پوزیشن‌های جدید:\n")
+        for i, pos in enumerate(new_positions):
+            is_last = (i == len(new_positions) - 1) and not old_positions
+            lines.append(_format_single_position(
+                pos, new_coins, open_orders, is_last=is_last, show_time=True
+            ))
+
+    # پوزیشن‌های قدیمی
+    if old_positions:
+        lines.append("   📌 پوزیشن‌های قبلی:\n")
+        for i, pos in enumerate(old_positions):
+            is_last = (i == len(old_positions) - 1)
+            lines.append(_format_single_position(
+                pos, new_coins, open_orders, is_last=is_last, show_time=False
+            ))
+
+    return "".join(lines)
 
 
 # ============================================================
@@ -269,22 +332,38 @@ def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
 #                        ساخت پیام
 # ============================================================
 def build_message(records, positions_map, fills_map):
+    total_positions = 0
+    for addr in positions_map:
+        total_positions += len(positions_map[addr].get("assetPositions", []))
+
     header = (
-        f"🆕 {len(records)} کیف پول برتر که در {FILLS_HOURS} ساعت گذشته معامله باز کرده‌اند\n"
-        "📅 ماهانه | 🏆 کل دوره\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🚀 گزارش کیف پول‌های برتر Hyperliquid\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱️ بازه: {FILLS_HOURS} ساعت گذشته\n"
+        f"👥 تعداد کیف پول فعال: {len(records)}\n"
+        f"📊 مجموع پوزیشن‌ها: {total_positions}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     lines = [header]
+
     for i, r in enumerate(records, 1):
         addr = r["address"]
         positions = positions_map.get(addr, {})
         fills = fills_map.get(addr, [])
+
+        month_sign = "🟢" if r["month_roi"] >= 0 else "🔴"
+        all_sign = "🏆" if r["all_roi"] >= 0 else "⚠️"
+
         lines.append(
-            f"{i}. {addr}\n"
-            f"   📅 {roi_str(r['month_roi'])} (${r['month_pnl']:,.0f})\n"
-            f"   🏆 {roi_str(r['all_roi'])} (${r['all_pnl']:,.0f})\n"
-            f"   ─── پوزیشن‌های باز ───\n"
+            f"┏━━━━━━━━━━━━━━━━━━━━━\n"
+            f"┃ #{i} · {short_addr(addr, 8)}\n"
+            f"┃ 🔗 {addr}\n"
+            f"┃\n"
+            f"┃ {month_sign} ماهانه: {roi_str(r['month_roi'])}  ·  {pnl_str(r['month_pnl'])}\n"
+            f"┃ {all_sign} کل دوره: {roi_str(r['all_roi'])}  ·  {pnl_str(r['all_pnl'])}\n"
+            f"┃\n"
             f"{format_positions(positions, fills)}"
+            f"┗━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
     return "".join(lines)
 
