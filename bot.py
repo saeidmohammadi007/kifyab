@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -7,11 +8,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 
 
-def fetch_top_traders(limit=10, window="allTime"):
-    """
-    دریافت ۱۰ معامله‌گر برتر از لیدربورد عمومی Hyperliquid.
-    window: "day" | "week" | "month" | "allTime"
-    """
+def fetch_top_traders(limit=10, window="allTime", debug=False):
     try:
         r = requests.get(LEADERBOARD_URL, timeout=60)
         r.raise_for_status()
@@ -20,26 +17,58 @@ def fetch_top_traders(limit=10, window="allTime"):
         print(f"خطا در دریافت داده: {e}")
         return []
 
-    rows = data if isinstance(data, list) else data.get("leaderboard", [])
+    # چند کلید ممکن را امتحان کن
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = (
+            data.get("leaderboardRows")
+            or data.get("leaderboard")
+            or data.get("rows")
+            or []
+        )
+    else:
+        rows = []
+
+    if debug:
+        print("--- نوع داده:", type(data).__name__)
+        if isinstance(data, dict):
+            print("--- کلیدها:", list(data.keys()))
+        print("--- تعداد ردیف:", len(rows))
+        if rows:
+            print("--- نمونه ردیف اول:")
+            print(json.dumps(rows[0], indent=2, ensure_ascii=False)[:1500])
+
     if not rows:
         print("داده‌ای در پاسخ وجود ندارد.")
         return []
 
     def get_perf(row, key):
-        for perf in row.get("windowPerformances", []):
+        perfs = row.get("windowPerformances") or []
+        for perf in perfs:
             if isinstance(perf, list) and len(perf) == 2 and perf[0] == window:
-                return perf[1].get(key, 0) or 0
-        return 0
+                val = perf[1].get(key, 0)
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
+    def safe_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
 
     sorted_rows = sorted(rows, key=lambda r: get_perf(r, "pnl"), reverse=True)[:limit]
 
     result = []
     for row in sorted_rows:
         result.append({
-            "address": row.get("ethAddress", "?"),
+            "address": row.get("ethAddress") or row.get("address") or "?",
             "pnl": get_perf(row, "pnl"),
             "roi": get_perf(row, "roi"),
-            "accountValue": row.get("accountValue", 0),
+            "accountValue": safe_float(row.get("accountValue", 0)),
         })
     return result
 
@@ -78,13 +107,12 @@ def send_telegram(message):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-    }
     try:
-        res = requests.post(url, json=payload, timeout=30)
+        res = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True,
+        }, timeout=30)
         res.raise_for_status()
         print("✅ پیام با موفقیت ارسال شد.")
     except Exception as e:
@@ -92,8 +120,8 @@ def send_telegram(message):
 
 
 def main():
-    window = "allTime"  # می‌توانی به "day" | "week" | "month" تغییر بدهی
-    traders = fetch_top_traders(limit=10, window=window)
+    window = "allTime"  # "day" | "week" | "month" | "allTime"
+    traders = fetch_top_traders(limit=10, window=window, debug=True)
     message = format_message(traders, window=window)
     send_telegram(message)
 
