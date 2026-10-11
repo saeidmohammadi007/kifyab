@@ -10,7 +10,7 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 
 LIMIT = 200
 MIN_ACCOUNT_VALUE = 100  # حداقل موجودی ۱۰۰ دلار
-FILLS_HOURS = 24  # بازه معاملات اخیر (ساعت)
+FILLS_HOURS = 4  # بازه معاملات اخیر (ساعت)
 SLEEP_BETWEEN_REQUESTS = 0.25  # مکث بین درخواست‌ها برای جلوگیری از rate limit
 
 
@@ -96,11 +96,32 @@ def roi_str(roi):
     return f"{pct:,.1f}%"
 
 
-def has_open_positions(positions_data):
-    """بررسی اینکه آیا کیف پول پوزیشن باز دارد یا نه"""
-    if not positions_data:
-        return False
-    return len(positions_data.get("assetPositions", [])) > 0
+def extract_new_coins(recent_fills):
+    """استخراج کوین‌هایی که در بازه مشخص شده پوزیشن جدید باز شده"""
+    new_coins = {}
+    for fill in recent_fills:
+        dir_ = fill.get("dir", "")
+        coin = fill.get("coin", "")
+
+        # فقط معاملات باز کردن پوزیشن
+        if dir_.startswith("Open"):
+            if coin not in new_coins or fill.get("time", 0) > new_coins[coin]["time"]:
+                new_coins[coin] = {
+                    "dir": dir_,
+                    "time": fill.get("time", 0),
+                    "px": safe_float(fill.get("px", 0)),
+                    "sz": safe_float(fill.get("sz", 0)),
+                    "fee": safe_float(fill.get("fee", 0)),
+                }
+    return new_coins
+
+
+def has_new_open_positions(recent_fills):
+    """بررسی اینکه آیا در بازه اخیر پوزیشن جدیدی باز شده یا نه"""
+    for fill in recent_fills:
+        if fill.get("dir", "").startswith("Open"):
+            return True
+    return False
 
 
 def format_positions(positions_data, recent_fills):
@@ -109,10 +130,7 @@ def format_positions(positions_data, recent_fills):
     if not asset_positions:
         return "   🔹 پوزیشن بازی ندارد\n"
 
-    # مجموعه کوین‌هایی که در N ساعت گذشته معامله شده‌اند
-    recent_coins = set()
-    for fill in recent_fills:
-        recent_coins.add(fill.get("coin", ""))
+    new_coins = extract_new_coins(recent_fills)
 
     lines = []
     for pos in asset_positions:
@@ -129,7 +147,7 @@ def format_positions(positions_data, recent_fills):
         lev_type = leverage.get("type", "cross")
 
         side = "🟢 LONG" if szi > 0 else "🔴 SHORT"
-        is_new = "🆕 " if coin in recent_coins else ""
+        is_new = "🆕 " if coin in new_coins else ""
 
         roe = p.get("returnOnEquity")
         roe_str = f"{safe_float(roe) * 100:,.1f}%" if roe else "N/A"
@@ -143,6 +161,15 @@ def format_positions(positions_data, recent_fills):
         )
         if liq_px:
             line += f" | ⚠️ لیکویید: ${safe_float(liq_px):,.4f}"
+
+        if coin in new_coins:
+            nc = new_coins[coin]
+            mins_ago = int((time.time() * 1000 - nc["time"]) / 60000)
+            line += (
+                f"\n      ⏱️ باز شده در: {mins_ago} دقیقه پیش\n"
+                f"      📝 نوع: {nc['dir']} | 💲 قیمت: ${nc['px']:,.4f} | 📦 حجم: {nc['sz']:,.4f}"
+            )
+
         lines.append(line)
 
     return "\n".join(lines) + "\n"
@@ -176,8 +203,8 @@ def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
 # ============================================================
 def build_message(records, positions_map, fills_map):
     header = (
-        f"🏆 {len(records)} کیف پول برتر Hyperliquid با پوزیشن باز\n"
-        f"📅 ماهانه | 🏆 کل دوره | 📌 پوزیشن‌های باز {FILLS_HOURS} ساعته\n"
+        f"🆕 {len(records)} کیف پول برتر که در {FILLS_HOURS} ساعت گذشته معامله باز کرده‌اند\n"
+        "📅 ماهانه | 🏆 کل دوره\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     lines = [header]
@@ -241,24 +268,27 @@ def main():
             continue
 
         print(f"[{idx}/{len(top)}] بررسی {addr}")
-        positions = fetch_positions(addr)
+
+        # ابتدا fills را چک کن (سبک‌تر و سریع‌تر)
+        fills = fetch_recent_fills(addr, hours=FILLS_HOURS)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-        # فیلتر: فقط کیف پول‌هایی که پوزیشن باز دارند
-        if not has_open_positions(positions):
+        # فیلتر: فقط کسانی که در بازه اخیر پوزیشن جدید باز کرده‌اند
+        if not has_new_open_positions(fills):
             continue
 
-        fills = fetch_recent_fills(addr, hours=FILLS_HOURS)
+        # حالا پوزیشن‌های باز را بگیر
+        positions = fetch_positions(addr)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
         positions_map[addr] = positions
         fills_map[addr] = fills
         filtered.append(r)
 
-    print(f"تعداد کیف پول با پوزیشن باز: {len(filtered)}")
+    print(f"تعداد کیف پول با معامله باز در {FILLS_HOURS} ساعت گذشته: {len(filtered)}")
 
     if not filtered:
-        send_telegram("⚠️ هیچ کیف پولی با پوزیشن باز پیدا نشد.")
+        send_telegram(f"⚠️ هیچ کیف پولی در {FILLS_HOURS} ساعت گذشته معامله باز نکرده است.")
         return
 
     message = build_message(filtered, positions_map, fills_map)
