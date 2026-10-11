@@ -39,14 +39,28 @@ def fetch_rows():
 
 
 def fetch_positions(address):
-    """دریافت پوزیشن‌های باز یک کیف پول"""
+    """دریافت پوزیشن‌ها و سفارش‌های باز یک کیف پول"""
     try:
         res = requests.post(INFO_URL, json={
             "type": "clearinghouseState",
             "user": address,
         }, timeout=15)
         res.raise_for_status()
-        return res.json()
+        data = res.json()
+
+        # دریافت سفارش‌های باز (شامل TP/SL)
+        try:
+            orders_res = requests.post(INFO_URL, json={
+                "type": "openOrders",
+                "user": address,
+            }, timeout=15)
+            orders_res.raise_for_status()
+            data["openOrders"] = orders_res.json()
+        except Exception as e:
+            print(f"خطا در دریافت سفارش‌های باز {address}: {e}")
+            data["openOrders"] = []
+
+        return data
     except Exception as e:
         print(f"خطا در دریافت پوزیشن‌های {address}: {e}")
         return {}
@@ -124,13 +138,55 @@ def has_new_open_positions(recent_fills):
     return False
 
 
+def extract_take_profits(open_orders, coin):
+    """استخراج حد سودهای مربوط به یک کوین خاص از سفارش‌های باز"""
+    tps = []
+    if not isinstance(open_orders, list):
+        return tps
+
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        if order.get("coin") != coin:
+            continue
+
+        order_type = str(order.get("orderType", ""))
+        # تشخیص سفارش حد سود
+        is_tp = (
+            "Take Profit" in order_type
+            or order.get("triggerCondition") == "tp"
+            or "tp" in order_type.lower()
+        )
+        if not is_tp:
+            continue
+
+        trigger_px = (
+            order.get("triggerPx")
+            or order.get("triggerPrice")
+            or order.get("isTrigger") and order.get("triggerPx")
+        )
+        if not trigger_px:
+            continue
+
+        tps.append({
+            "px": safe_float(trigger_px),
+            "sz": safe_float(order.get("sz", 0)),
+            "is_market": bool(order.get("isMarket", False)),
+        })
+
+    # مرتب‌سازی بر اساس قیمت
+    tps.sort(key=lambda x: x["px"])
+    return tps
+
+
 def format_positions(positions_data, recent_fills):
-    """فرمت‌دهی پوزیشن‌های باز با علامت‌گذاری معاملات جدید"""
+    """فرمت‌دهی پوزیشن‌های باز با علامت‌گذاری معاملات جدید و نمایش حد سود"""
     asset_positions = positions_data.get("assetPositions", [])
     if not asset_positions:
         return "   🔹 پوزیشن بازی ندارد\n"
 
     new_coins = extract_new_coins(recent_fills)
+    open_orders = positions_data.get("openOrders", []) or []
 
     lines = []
     for pos in asset_positions:
@@ -161,6 +217,15 @@ def format_positions(positions_data, recent_fills):
         )
         if liq_px:
             line += f" | ⚠️ لیکویید: ${safe_float(liq_px):,.4f}"
+
+        # افزودن حد سود
+        take_profits = extract_take_profits(open_orders, coin)
+        if take_profits:
+            tp_parts = []
+            for tp in take_profits:
+                tp_type = "بازار" if tp["is_market"] else "لیمیت"
+                tp_parts.append(f"${tp['px']:,.4f} ({tp_type})")
+            line += f"\n      🎯 حد سود: {' | '.join(tp_parts)}"
 
         if coin in new_coins:
             nc = new_coins[coin]
@@ -279,7 +344,7 @@ def main():
         if not has_new_open_positions(fills):
             continue
 
-        # حالا پوزیشن‌های باز را بگیر
+        # حالا پوزیشن‌های باز + سفارش‌های باز (TP/SL) را بگیر
         positions = fetch_positions(addr)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
