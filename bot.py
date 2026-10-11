@@ -1,15 +1,22 @@
 import os
+import time
 import requests
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+INFO_URL = "https://api.hyperliquid.xyz/info"
 
 LIMIT = 100
 MIN_ACCOUNT_VALUE = 100  # حداقل موجودی ۱۰۰ دلار
+FILLS_HOURS = 24  # بازه معاملات اخیر (ساعت)
+SLEEP_BETWEEN_REQUESTS = 0.25  # مکث بین درخواست‌ها برای جلوگیری از rate limit
 
 
+# ============================================================
+#                         دریافت داده
+# ============================================================
 def fetch_rows():
     try:
         r = requests.get(LEADERBOARD_URL, timeout=60)
@@ -31,6 +38,41 @@ def fetch_rows():
     return []
 
 
+def fetch_positions(address):
+    """دریافت پوزیشن‌های باز یک کیف پول"""
+    try:
+        res = requests.post(INFO_URL, json={
+            "type": "clearinghouseState",
+            "user": address,
+        }, timeout=15)
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        print(f"خطا در دریافت پوزیشن‌های {address}: {e}")
+        return {}
+
+
+def fetch_recent_fills(address, hours=FILLS_HOURS):
+    """دریافت معاملات انجام شده در N ساعت گذشته"""
+    now = int(time.time() * 1000)
+    start = now - (hours * 3600 * 1000)
+    try:
+        res = requests.post(INFO_URL, json={
+            "type": "userFillsByTime",
+            "user": address,
+            "startTime": start,
+            "endTime": now,
+        }, timeout=15)
+        res.raise_for_status()
+        return res.json()
+    except Exception as e:
+        print(f"خطا در دریافت معاملات {address}: {e}")
+        return []
+
+
+# ============================================================
+#                        ابزار کمکی
+# ============================================================
 def get_perf(row, window, key):
     perfs = row.get("windowPerformances") or []
     for perf in perfs:
@@ -54,6 +96,54 @@ def roi_str(roi):
     return f"{pct:,.1f}%"
 
 
+def format_positions(positions_data, recent_fills):
+    """فرمت‌دهی پوزیشن‌های باز با علامت‌گذاری معاملات جدید"""
+    asset_positions = positions_data.get("assetPositions", [])
+    if not asset_positions:
+        return "   🔹 پوزیشن بازی ندارد\n"
+
+    # مجموعه کوین‌هایی که در N ساعت گذشته معامله شده‌اند
+    recent_coins = set()
+    for fill in recent_fills:
+        recent_coins.add(fill.get("coin", ""))
+
+    lines = []
+    for pos in asset_positions:
+        p = pos.get("position", {})
+        coin = p.get("coin", "?")
+        szi = safe_float(p.get("szi", 0))
+        entry_px = safe_float(p.get("entryPx", 0))
+        pos_value = safe_float(p.get("positionValue", 0))
+        unrealized_pnl = safe_float(p.get("unrealizedPnl", 0))
+        margin_used = safe_float(p.get("marginUsed", 0))
+        liq_px = p.get("liquidationPx")
+        leverage = p.get("leverage", {}) or {}
+        lev_value = leverage.get("value", "?")
+        lev_type = leverage.get("type", "cross")
+
+        side = "🟢 LONG" if szi > 0 else "🔴 SHORT"
+        is_new = "🆕 " if coin in recent_coins else ""
+
+        roe = p.get("returnOnEquity")
+        roe_str = f"{safe_float(roe) * 100:,.1f}%" if roe else "N/A"
+
+        line = (
+            f"   {is_new}{side} {coin}\n"
+            f"      📊 حجم: {abs(szi):,.4f} | 💰 ارزش: ${pos_value:,.0f}\n"
+            f"      🎯 اهرم: {lev_value}x ({lev_type})\n"
+            f"      📈 ورود: ${entry_px:,.4f} | 💵 سود/زیان: ${unrealized_pnl:,.0f} ({roe_str})\n"
+            f"      🛡️ مارجین: ${margin_used:,.0f}"
+        )
+        if liq_px:
+            line += f" | ⚠️ لیکویید: ${safe_float(liq_px):,.4f}"
+        lines.append(line)
+
+    return "\n".join(lines) + "\n"
+
+
+# ============================================================
+#                       انتخاب برترین‌ها
+# ============================================================
 def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
     """۱۰۰ کیف پول برتر بر اساس ROI کل دوره"""
     candidates = []
@@ -74,22 +164,33 @@ def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
     return candidates[:limit]
 
 
-def build_message(records):
+# ============================================================
+#                        ساخت پیام
+# ============================================================
+def build_message(records, positions_map, fills_map):
     header = (
         "🏆 ۱۰۰ کیف پول برتر Hyperliquid (کل دوره)\n"
-        "📅 ماهانه | 🏆 کل دوره\n"
+        "📅 ماهانه | 🏆 کل دوره | 📌 پوزیشن‌های باز ۲۴ ساعته\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     lines = [header]
     for i, r in enumerate(records, 1):
+        addr = r["address"]
+        positions = positions_map.get(addr, {})
+        fills = fills_map.get(addr, [])
         lines.append(
-            f"{i}. {r['address']}\n"
+            f"{i}. {addr}\n"
             f"   📅 {roi_str(r['month_roi'])} (${r['month_pnl']:,.0f})\n"
             f"   🏆 {roi_str(r['all_roi'])} (${r['all_pnl']:,.0f})\n"
+            f"   ─── پوزیشن‌های باز ───\n"
+            f"{format_positions(positions, fills)}"
         )
     return "".join(lines)
 
 
+# ============================================================
+#                       ارسال به تلگرام
+# ============================================================
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("خطا: توکن یا Chat ID تنظیم نشده است.")
@@ -111,14 +212,31 @@ def send_telegram(message):
             print(f"خطا در ارسال بخش {idx}: {e}")
 
 
+# ============================================================
+#                          اجرای اصلی
+# ============================================================
 def main():
     rows = fetch_rows()
     if not rows:
         send_telegram("⚠️ دریافت داده از Hyperliquid ناموفق بود.")
         return
+
     top = top_by_alltime(rows)
     print(f"تعداد کیف پول در گزارش: {len(top)}")
-    message = build_message(top)
+
+    positions_map = {}
+    fills_map = {}
+    for idx, r in enumerate(top, 1):
+        addr = r["address"]
+        if not addr or addr == "?":
+            continue
+        print(f"[{idx}/{len(top)}] دریافت داده {addr}")
+        positions_map[addr] = fetch_positions(addr)
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        fills_map[addr] = fetch_recent_fills(addr, hours=FILLS_HOURS)
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    message = build_message(top, positions_map, fills_map)
     send_telegram(message)
 
 
