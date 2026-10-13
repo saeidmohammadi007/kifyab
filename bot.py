@@ -6,12 +6,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
-INFO_URL = "https://api.hyperliquid.xyz/info"
 
-LIMIT = 200
-MIN_ACCOUNT_VALUE = 100  # حداقل موجودی ۱۰۰ دلار
-FILLS_HOURS = 1  # بازه معاملات اخیر (۱ ساعت)
-SLEEP_BETWEEN_REQUESTS = 0.3  # مکث بین درخواست‌ها برای جلوگیری از rate limit
+LIMIT = 100  # تعداد تریدرهای برتر
 
 
 # ============================================================
@@ -38,56 +34,11 @@ def fetch_rows():
     return []
 
 
-def fetch_positions(address):
-    """دریافت پوزیشن‌ها و سفارش‌های باز یک کیف پول"""
-    try:
-        res = requests.post(INFO_URL, json={
-            "type": "clearinghouseState",
-            "user": address,
-        }, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-
-        # دریافت سفارش‌های باز (شامل TP/SL)
-        try:
-            orders_res = requests.post(INFO_URL, json={
-                "type": "openOrders",
-                "user": address,
-            }, timeout=15)
-            orders_res.raise_for_status()
-            data["openOrders"] = orders_res.json()
-        except Exception as e:
-            print(f"خطا در دریافت سفارش‌های باز {address}: {e}")
-            data["openOrders"] = []
-
-        return data
-    except Exception as e:
-        print(f"خطا در دریافت پوزیشن‌های {address}: {e}")
-        return {}
-
-
-def fetch_recent_fills(address, hours=FILLS_HOURS):
-    """دریافت معاملات انجام شده در N ساعت گذشته"""
-    now = int(time.time() * 1000)
-    start = now - (hours * 3600 * 1000)
-    try:
-        res = requests.post(INFO_URL, json={
-            "type": "userFillsByTime",
-            "user": address,
-            "startTime": start,
-            "endTime": now,
-        }, timeout=15)
-        res.raise_for_status()
-        return res.json()
-    except Exception as e:
-        print(f"خطا در دریافت معاملات {address}: {e}")
-        return []
-
-
 # ============================================================
 #                        ابزار کمکی
 # ============================================================
 def get_perf(row, window, key):
+    """استخراج یک متریک خاص (roi یا pnl) در یک بازه زمانی مشخص"""
     perfs = row.get("windowPerformances") or []
     for perf in perfs:
         if isinstance(perf, list) and len(perf) == 2 and perf[0] == window:
@@ -106,221 +57,40 @@ def safe_float(v):
 
 
 def roi_str(roi):
+    """فرمت‌دهی ROI به صورت درصد"""
     pct = roi * 100 if abs(roi) < 10 else roi
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:,.1f}%"
 
 
 def pnl_str(pnl):
+    """فرمت‌دهی PnL به صورت دلاری"""
     sign = "+" if pnl >= 0 else ""
     return f"{sign}${pnl:,.0f}"
-
-
-def short_addr(addr, n=8):
-    """کوتاه کردن آدرس برای نمایش تمیزتر"""
-    if not addr or len(addr) < 14:
-        return addr
-    return f"{addr[:n]}...{addr[-4:]}"
-
-
-def fmt_price(px):
-    """فرمت قیمت بر اساس بزرگی عدد"""
-    if px == 0:
-        return "$0"
-    if px >= 1000:
-        return f"${px:,.2f}"
-    if px >= 1:
-        return f"${px:,.4f}"
-    return f"${px:,.6f}"
-
-
-def fmt_time_ago(ms_time):
-    """نمایش زمان به صورت خوانا"""
-    secs_ago = int((time.time() * 1000 - ms_time) / 1000)
-    if secs_ago < 60:
-        return f"{secs_ago} ثانیه پیش"
-    if secs_ago < 3600:
-        return f"{secs_ago // 60} دقیقه پیش"
-    return f"{secs_ago // 3600} ساعت پیش"
-
-
-def extract_new_coins(recent_fills):
-    """استخراج کوین‌هایی که در بازه مشخص شده پوزیشن جدید باز شده"""
-    new_coins = {}
-    for fill in recent_fills:
-        dir_ = fill.get("dir", "")
-        coin = fill.get("coin", "")
-
-        if dir_.startswith("Open"):
-            if coin not in new_coins or fill.get("time", 0) > new_coins[coin]["time"]:
-                new_coins[coin] = {
-                    "dir": dir_,
-                    "time": fill.get("time", 0),
-                    "px": safe_float(fill.get("px", 0)),
-                    "sz": safe_float(fill.get("sz", 0)),
-                    "fee": safe_float(fill.get("fee", 0)),
-                }
-    return new_coins
-
-
-def has_new_open_positions(recent_fills):
-    """بررسی اینکه آیا در بازه اخیر پوزیشن جدیدی باز شده یا نه"""
-    for fill in recent_fills:
-        if fill.get("dir", "").startswith("Open"):
-            return True
-    return False
-
-
-def extract_take_profits(open_orders, coin):
-    """استخراج حد سودهای مربوط به یک کوین خاص از سفارش‌های باز"""
-    tps = []
-    if not isinstance(open_orders, list):
-        return tps
-
-    for order in open_orders:
-        if not isinstance(order, dict):
-            continue
-        if order.get("coin") != coin:
-            continue
-
-        order_type = str(order.get("orderType", ""))
-        is_tp = (
-            "Take Profit" in order_type
-            or order.get("triggerCondition") == "tp"
-            or "tp" in order_type.lower()
-        )
-        if not is_tp:
-            continue
-
-        trigger_px = order.get("triggerPx") or order.get("triggerPrice")
-        if not trigger_px:
-            continue
-
-        tps.append({
-            "px": safe_float(trigger_px),
-            "sz": safe_float(order.get("sz", 0)),
-            "is_market": bool(order.get("isMarket", False)),
-        })
-
-    tps.sort(key=lambda x: x["px"])
-    return tps
-
-
-def _format_single_position(pos, new_coins, open_orders, is_last=False, show_time=False):
-    """فرمت‌دهی یک پوزیشن به صورت درخت‌نما"""
-    p = pos.get("position", {})
-    coin = p.get("coin", "?")
-    szi = safe_float(p.get("szi", 0))
-    entry_px = safe_float(p.get("entryPx", 0))
-    pos_value = safe_float(p.get("positionValue", 0))
-    unrealized_pnl = safe_float(p.get("unrealizedPnl", 0))
-    margin_used = safe_float(p.get("marginUsed", 0))
-    liq_px = p.get("liquidationPx")
-    leverage = p.get("leverage", {}) or {}
-    lev_value = leverage.get("value", "?")
-    lev_type = leverage.get("type", "cross")
-
-    side_icon = "🟢" if szi > 0 else "🔴"
-    side_txt = "LONG" if szi > 0 else "SHORT"
-
-    roe = p.get("returnOnEquity")
-    roe_val = safe_float(roe) * 100 if roe else 0
-    pnl_icon = "📈" if unrealized_pnl >= 0 else "📉"
-
-    prefix = "   └ " if is_last else "   ├ "
-    cont = "      " if is_last else "   │  "
-
-    lines = []
-    lines.append(f"{prefix}{side_icon} {coin} · {side_txt} · {lev_value}x {lev_type}\n")
-    lines.append(f"{cont}💰 ارزش: ${pos_value:,.0f}  |  📊 حجم: {abs(szi):,.4f}\n")
-    lines.append(f"{cont}📈 ورود: {fmt_price(entry_px)}\n")
-
-    pnl_sign = "+" if unrealized_pnl >= 0 else ""
-    lines.append(
-        f"{cont}{pnl_icon} سود/زیان: {pnl_sign}${unrealized_pnl:,.0f} ({roe_val:+.1f}%)\n"
-    )
-
-    liq_txt = f"  |  ⚠️ لیکویید: {fmt_price(safe_float(liq_px))}" if liq_px else ""
-    lines.append(f"{cont}🛡️ مارجین: ${margin_used:,.0f}{liq_txt}\n")
-
-    # حد سود
-    take_profits = extract_take_profits(open_orders, coin)
-    if take_profits:
-        tp_parts = []
-        for tp in take_profits:
-            tp_type = "بازار" if tp["is_market"] else "لیمیت"
-            tp_parts.append(f"{fmt_price(tp['px'])} ({tp_type})")
-        lines.append(f"{cont}🎯 حد سود: {' | '.join(tp_parts)}\n")
-
-    # اطلاعات زمان باز شدن (فقط برای پوزیشن‌های جدید)
-    if show_time and coin in new_coins:
-        nc = new_coins[coin]
-        lines.append(
-            f"{cont}⏱️ باز شده: {fmt_time_ago(nc['time'])}\n"
-            f"{cont}📝 {nc['dir']} · {fmt_price(nc['px'])} · {nc['sz']:,.4f}\n"
-        )
-
-    return "".join(lines)
-
-
-def format_positions(positions_data, recent_fills):
-    """فرمت‌دهی تمیز پوزیشن‌ها با تفکیک جدید/قبلی"""
-    asset_positions = positions_data.get("assetPositions", [])
-    if not asset_positions:
-        return "   └ هیچ پوزیشن بازی ندارد\n"
-
-    new_coins = extract_new_coins(recent_fills)
-    open_orders = positions_data.get("openOrders", []) or []
-
-    # جداسازی پوزیشن‌های جدید از قدیمی
-    new_positions = []
-    old_positions = []
-    for pos in asset_positions:
-        coin = pos.get("position", {}).get("coin", "")
-        if coin in new_coins:
-            new_positions.append(pos)
-        else:
-            old_positions.append(pos)
-
-    lines = []
-
-    # پوزیشن‌های جدید
-    if new_positions:
-        lines.append("   🆕 پوزیشن‌های جدید:\n")
-        for i, pos in enumerate(new_positions):
-            is_last = (i == len(new_positions) - 1) and not old_positions
-            lines.append(_format_single_position(
-                pos, new_coins, open_orders, is_last=is_last, show_time=True
-            ))
-
-    # پوزیشن‌های قدیمی
-    if old_positions:
-        lines.append("   📌 پوزیشن‌های قبلی:\n")
-        for i, pos in enumerate(old_positions):
-            is_last = (i == len(old_positions) - 1)
-            lines.append(_format_single_position(
-                pos, new_coins, open_orders, is_last=is_last, show_time=False
-            ))
-
-    return "".join(lines)
 
 
 # ============================================================
 #                       انتخاب برترین‌ها
 # ============================================================
-def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
+def top_by_alltime(rows, limit=LIMIT):
     """N کیف پول برتر بر اساس ROI کل دوره"""
     candidates = []
     for row in rows:
-        acc = safe_float(row.get("accountValue", 0))
-        if acc < min_account:
-            continue
         addr = row.get("ethAddress") or row.get("address") or "?"
+        if not addr or addr == "?":
+            continue
+
         candidates.append({
             "address": addr,
+            "display_name": row.get("displayName") or "",
+            "account_value": safe_float(row.get("accountValue", 0)),
+            "day_roi": get_perf(row, "day", "roi"),
+            "week_roi": get_perf(row, "week", "roi"),
             "month_roi": get_perf(row, "month", "roi"),
-            "month_pnl": get_perf(row, "month", "pnl"),
             "all_roi": get_perf(row, "allTime", "roi"),
+            "day_pnl": get_perf(row, "day", "pnl"),
+            "week_pnl": get_perf(row, "week", "pnl"),
+            "month_pnl": get_perf(row, "month", "pnl"),
             "all_pnl": get_perf(row, "allTime", "pnl"),
         })
 
@@ -331,38 +101,27 @@ def top_by_alltime(rows, limit=LIMIT, min_account=MIN_ACCOUNT_VALUE):
 # ============================================================
 #                        ساخت پیام
 # ============================================================
-def build_message(records, positions_map, fills_map):
-    total_positions = 0
-    for addr in positions_map:
-        total_positions += len(positions_map[addr].get("assetPositions", []))
-
+def build_message(records):
     header = (
-        f"🚀 گزارش کیف پول‌های برتر Hyperliquid\n"
+        f"🏆 گزارش {len(records)} تریدر برتر Hyperliquid\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱️ بازه: {FILLS_HOURS} ساعت گذشته\n"
-        f"👥 تعداد کیف پول فعال: {len(records)}\n"
-        f"📊 مجموع پوزیشن‌ها: {total_positions}\n"
+        f"📊 معیار رتبه‌بندی: ROI کل دوره\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     lines = [header]
 
     for i, r in enumerate(records, 1):
-        addr = r["address"]
-        positions = positions_map.get(addr, {})
-        fills = fills_map.get(addr, [])
-
-        month_sign = "🟢" if r["month_roi"] >= 0 else "🔴"
-        all_sign = "🏆" if r["all_roi"] >= 0 else "⚠️"
-
+        name_part = f" ({r['display_name']})" if r["display_name"] else ""
         lines.append(
             f"┏━━━━━━━━━━━━━━━━━━━━━\n"
-            f"┃ #{i} · {short_addr(addr, 8)}\n"
-            f"┃ 🔗 {addr}\n"
+            f"┃ #{i}{name_part}\n"
+            f"┃ 🔗 {r['address']}\n"
+            f"┃ 💰 موجودی: ${r['account_value']:,.0f}\n"
             f"┃\n"
-            f"┃ {month_sign} ماهانه: {roi_str(r['month_roi'])}  ·  {pnl_str(r['month_pnl'])}\n"
-            f"┃ {all_sign} کل دوره: {roi_str(r['all_roi'])}  ·  {pnl_str(r['all_pnl'])}\n"
-            f"┃\n"
-            f"{format_positions(positions, fills)}"
+            f"┃ 📅 روزانه : {roi_str(r['day_roi']):>10}  ·  {pnl_str(r['day_pnl']):>12}\n"
+            f"┃ 📆 هفتگی : {roi_str(r['week_roi']):>10}  ·  {pnl_str(r['week_pnl']):>12}\n"
+            f"┃ 🗓️ ماهانه : {roi_str(r['month_roi']):>10}  ·  {pnl_str(r['month_pnl']):>12}\n"
+            f"┃ 🏆 کل دوره: {roi_str(r['all_roi']):>10}  ·  {pnl_str(r['all_pnl']):>12}\n"
             f"┗━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
     return "".join(lines)
@@ -377,7 +136,14 @@ def send_telegram(message):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chunks = [message[i:i + 4000] for i in range(0, len(message), 4000)]
+
+    # به دلیل حجم کم پیام، نیازی به تقسیم نیست
+    # اما اگر پیام از 4096 کاراکتر بیشتر شد، تقسیم می‌کنیم
+    if len(message) <= 4096:
+        chunks = [message]
+    else:
+        chunks = [message[i:i + 4000] for i in range(0, len(message), 4000)]
+
     total = len(chunks)
     for idx, chunk in enumerate(chunks, 1):
         try:
@@ -402,42 +168,13 @@ def main():
         return
 
     top = top_by_alltime(rows)
-    print(f"تعداد کیف پول در لیست اولیه: {len(top)}")
+    print(f"تعداد تریدرهای برتر انتخاب شده: {len(top)}")
 
-    positions_map = {}
-    fills_map = {}
-    filtered = []
-
-    for idx, r in enumerate(top, 1):
-        addr = r["address"]
-        if not addr or addr == "?":
-            continue
-
-        print(f"[{idx}/{len(top)}] بررسی {addr}")
-
-        # ابتدا fills را چک کن (سبک‌تر و سریع‌تر)
-        fills = fetch_recent_fills(addr, hours=FILLS_HOURS)
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-        # فیلتر: فقط کسانی که در بازه اخیر پوزیشن جدید باز کرده‌اند
-        if not has_new_open_positions(fills):
-            continue
-
-        # حالا پوزیشن‌های باز + سفارش‌های باز (TP/SL) را بگیر
-        positions = fetch_positions(addr)
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-        positions_map[addr] = positions
-        fills_map[addr] = fills
-        filtered.append(r)
-
-    print(f"تعداد کیف پول با معامله باز در {FILLS_HOURS} ساعت گذشته: {len(filtered)}")
-
-    if not filtered:
-        send_telegram(f"⚠️ هیچ کیف پولی در {FILLS_HOURS} ساعت گذشته معامله باز نکرده است.")
+    if not top:
+        send_telegram("⚠️ هیچ تریدری با آدرس معتبر یافت نشد.")
         return
 
-    message = build_message(filtered, positions_map, fills_map)
+    message = build_message(top)
     send_telegram(message)
 
 
