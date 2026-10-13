@@ -13,19 +13,23 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 
 # ------------------ تنظیمات اصلی ------------------
 LIMIT = 20                       # تعداد تریدر برتر نمایش داده‌شده
-MIN_ACCOUNT_VALUE = 5000         # حداقل موجودی دلاری
+MAX_ACCOUNT_VALUE = None          # حداکثر موجودی دلاری (None = بدون سقف)
+MIN_ACCOUNT_VALUE = 0         # حداقل موجودی دلاری
 MIN_WEEK_VLM = 1000              # حداقل حجم معاملات هفته/ماه اخیر
 MIN_AGE_DAYS = 365               # حداقل سابقه (یک سال)
 MIN_PASSING_TO_SHOW = 5          # حداقل ماه موفق برای نمایش
 
 MONTHLY_ROI_THRESHOLD = 0.05     # آستانه ROI هر ماه (۵٪)
 MONTHS_TO_CHECK = 12             # تعداد ماه‌های کامل اخیر
-MIN_MONTH_START_EQUITY = 500     # حداقل موجودی ابتدای ماه برای معتبر بودن ROI
+MIN_MONTH_START_EQUITY = 20     # حداقل موجودی ابتدای ماه برای معتبر بودن ROI
 MAX_ALLOWED_MONTH_LOSS = -0.30   # اگر ماهی بدتر از این بود حذف شود (None = غیرفعال)
 MAX_GAP_DAYS = 15                # حداکثر فاصله‌ی مجاز نقطه‌ی history تا مرز ماه
 
 REQUIRE_ALL_MONTHS_POSITIVE = True   # فقط تریدرهایی که همه ماه‌ها ROI مثبت دارند
 MIN_CLOSED_TRADES = 30               # حداقل تعداد معامله‌ی بسته‌شده برای محاسبه‌ی وین‌ریت
+MAX_POSITION_SIZE = 0.03             # حداکثر مارجین هر ورود نسبت به موجودی (0.03 = ۳٪؛ None = غیرفعال)
+MAX_COINS_FOR_LEVERAGE = 8           # اهرم فقط برای این تعداد کوین پرمعامله‌ی هر تریدر گرفته می‌شود
+SIZE_METRIC = "max"                  # "max" = هر ورود، "p90" = ۹۰٪ ورودی‌ها، "median" = میانه
 MIN_WIN_RATE = None                  # مثلاً 0.5 یعنی فقط وین‌ریت ≥ ۵۰٪ (None = بدون فیلتر)
 MIN_VALID_MONTHS = 10                # حداقل تعداد ماه با داده‌ی معتبر (ماه‌های بدون داده نادیده گرفته می‌شوند)
 
@@ -244,7 +248,36 @@ def fetch_fills(address):
         return []
 
 
-def compute_trade_stats(fills, av_ts=None, av_vals=None):
+def fetch_leverage_map(address, fills):
+    """
+    اهرم فعلی تریدر برای پرمعامله‌ترین کوین‌هایش (activeAssetData).
+    تاریخچه‌ی اهرم در API نیست؛ این مقدار تخمین است.
+    """
+    counts = {}
+    for f in fills:
+        if str(f.get("dir", "")).startswith("Open"):
+            coin = f.get("coin")
+            counts[coin] = counts.get(coin, 0) + 1
+    top = sorted(counts, key=counts.get, reverse=True)[:MAX_COINS_FOR_LEVERAGE]
+
+    result = {}
+    for coin in top:
+        try:
+            res = request_with_retry(
+                "POST", INFO_URL,
+                json={"type": "activeAssetData", "user": address, "coin": coin},
+                timeout=15,
+            )
+            lev = safe_float(((res.json() or {}).get("leverage") or {}).get("value"))
+            if lev > 0:
+                result[coin] = lev
+        except Exception as e:
+            print(f"   خطا در leverage {coin}: {e}")
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+    return result
+
+
+def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
     """
     وین‌ریت بر اساس معاملات بسته‌شده. fillهای یک سفارش (oid) یک معامله حساب
     می‌شوند. سود خالص = closedPnl - کارمزد fillهای بستن.
@@ -286,15 +319,19 @@ def compute_trade_stats(fills, av_ts=None, av_vals=None):
         )
 
     sizes = []
-    for t, notional in opens.values():
+    for (coin, _oid), (t, notional) in opens.items():
+        lev = (lev_map or {}).get(coin)
+        if not lev:
+            continue
         equity = value_near(av_ts, av_vals, t) if av_ts else None
         if equity and equity > 0 and notional > 0:
-            sizes.append(notional / equity)
+            sizes.append((notional / lev) / equity)   # مارجین / موجودی
     sizes.sort()
 
-    size_median = size_p90 = None
+    size_median = size_p90 = size_max = None
     if len(sizes) >= 10:
         size_median = sizes[len(sizes) // 2]
+        size_max = sizes[-1]
         size_p90 = sizes[min(len(sizes) - 1, int(len(sizes) * 0.9))]
 
     return {
@@ -305,6 +342,7 @@ def compute_trade_stats(fills, av_ts=None, av_vals=None):
         "per_day": n / max(days, 1),
         "size_median": size_median,
         "size_p90": size_p90,
+        "size_max": size_max,
     }
 
 
@@ -318,8 +356,9 @@ def trade_stats_str(r):
     lines = [text, f"🔁 میانگین معامله در روز: {s['per_day']:.1f}"]
     if s["size_median"] is not None:
         lines.append(
-            f"💼 حجم هر ورود نسبت به موجودی: میانه {s['size_median']*100:.0f}% "
-            f"| ۹۰٪ ورودی‌ها زیر {s['size_p90']*100:.0f}%"
+            f"💼 مارجین هر ورود (تخمینی) نسبت به موجودی: میانه {s['size_median']*100:.1f}% "
+            f"| ۹۰٪ ورودی‌ها زیر {s['size_p90']*100:.1f}% "
+            f"| حداکثر {s['size_max']*100:.1f}%"
         )
     return "\n┃ ".join(lines)
 
@@ -353,6 +392,8 @@ def build_candidates(rows):
 
 def passes_light_filters(c):
     if c["account_value"] < MIN_ACCOUNT_VALUE:
+        return False
+    if MAX_ACCOUNT_VALUE is not None and c["account_value"] > MAX_ACCOUNT_VALUE:
         return False
     if c["week_vlm"] < MIN_WEEK_VLM and c["month_vlm"] < MIN_WEEK_VLM:
         return False
@@ -422,8 +463,11 @@ def select_top_traders(rows):
     print(f"تعداد تریدرهای با ≥ {MIN_PASSING_TO_SHOW} ماه موفق: {len(filtered)}")
     # وین‌ریت فقط برای تریدرهای باقی‌مانده (تعداد درخواست اضافه کم است)
     for c in filtered:
+        fills = fetch_fills(c["address"])
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        lev_map = fetch_leverage_map(c["address"], fills)
         c["trade_stats"] = compute_trade_stats(
-            fetch_fills(c["address"]), c.get("av_ts"), c.get("av_vals")
+            fills, c.get("av_ts"), c.get("av_vals"), lev_map
         )
         time.sleep(SLEEP_BETWEEN_REQUESTS)
 
@@ -434,12 +478,35 @@ def select_top_traders(rows):
         ]
         print(f"پس از فیلتر وین‌ریت ≥ {MIN_WIN_RATE*100:.0f}%: {len(filtered)}")
 
+    if MAX_POSITION_SIZE is not None:
+        size_key = {"max": "size_max", "p90": "size_p90", "median": "size_median"}[SIZE_METRIC]
+        filtered = [
+            c for c in filtered
+            if c["trade_stats"]
+            and c["trade_stats"].get(size_key) is not None
+            and c["trade_stats"][size_key] <= MAX_POSITION_SIZE
+        ]
+        print(f"پس از فیلتر حجم ورود ≤ {MAX_POSITION_SIZE*100:.1f}%: {len(filtered)}")
+
     return filtered[:LIMIT]
 
 
 # ============================================================
 #                        ساخت پیام
 # ============================================================
+def account_filter_line():
+    if MIN_ACCOUNT_VALUE <= 0 and MAX_ACCOUNT_VALUE is None:
+        return ""
+    hi = f"${MAX_ACCOUNT_VALUE:,}" if MAX_ACCOUNT_VALUE is not None else "بدون سقف"
+    return f"   • موجودی ${MIN_ACCOUNT_VALUE:,} تا {hi}\n"
+
+
+def size_filter_line():
+    if MAX_POSITION_SIZE is None:
+        return ""
+    return f"   • مارجین هر ورود ≤ {MAX_POSITION_SIZE*100:.1f}% موجودی\n"
+
+
 def build_header(count):
     return (
         f"🏆 {count} تریدر برتر Hyperliquid\n"
@@ -447,7 +514,8 @@ def build_header(count):
         f"📊 معیار رتبه‌بندی: تعداد ماه‌های با ROI ≥ "
         f"{MONTHLY_ROI_THRESHOLD*100:.0f}% (از {MONTHS_TO_CHECK} ماه کامل اخیر)\n"
         f"✅ فیلترها:\n"
-        f"   • موجودی ≥ ${MIN_ACCOUNT_VALUE:,}\n"
+        f"{account_filter_line()}"
+        f"{size_filter_line()}"
         f"   • حجم معاملات هفته/ماه ≥ ${MIN_WEEK_VLM:,}\n"
         f"   • سابقه ≥ {MIN_AGE_DAYS} روز\n"
         f"   • حداقل {MIN_PASSING_TO_SHOW} ماه موفق برای نمایش\n"
