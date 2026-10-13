@@ -25,6 +25,8 @@ MAX_ALLOWED_MONTH_LOSS = -0.30   # اگر ماهی بدتر از این بود �
 MAX_GAP_DAYS = 15                # حداکثر فاصله‌ی مجاز نقطه‌ی history تا مرز ماه
 
 REQUIRE_ALL_MONTHS_POSITIVE = True   # فقط تریدرهایی که همه ماه‌ها ROI مثبت دارند
+MIN_CLOSED_TRADES = 30               # حداقل تعداد معامله‌ی بسته‌شده برای محاسبه‌ی وین‌ریت
+MIN_WIN_RATE = None                  # مثلاً 0.5 یعنی فقط وین‌ریت ≥ ۵۰٪ (None = بدون فیلتر)
 MIN_VALID_MONTHS = 10                # حداقل تعداد ماه با داده‌ی معتبر (ماه‌های بدون داده نادیده گرفته می‌شوند)
 
 # ------------------ تنظیمات عملکرد ------------------
@@ -227,6 +229,101 @@ def compute_monthly_rois(series):
     return rois, passing
 
 
+def fetch_fills(address):
+    """آخرین معاملات (حداکثر ۲۰۰۰ fill اخیر)"""
+    try:
+        res = request_with_retry(
+            "POST", INFO_URL,
+            json={"type": "userFills", "user": address},
+            timeout=20,
+        )
+        data = res.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"   خطا در fills {address}: {e}")
+        return []
+
+
+def compute_trade_stats(fills, av_ts=None, av_vals=None):
+    """
+    وین‌ریت بر اساس معاملات بسته‌شده. fillهای یک سفارش (oid) یک معامله حساب
+    می‌شوند. سود خالص = closedPnl - کارمزد fillهای بستن.
+    """
+    groups = {}
+    for f in fills:
+        closed = safe_float(f.get("closedPnl"))
+        direction = str(f.get("dir", ""))
+        if closed == 0 and not direction.startswith("Close"):
+            continue
+        key = (f.get("coin"), f.get("oid"))
+        groups[key] = groups.get(key, 0.0) + closed - safe_float(f.get("fee"))
+
+    nets = list(groups.values())
+    n = len(nets)
+    if n < MIN_CLOSED_TRADES:
+        return None
+
+    wins = [x for x in nets if x > 0]
+    losses = [x for x in nets if x <= 0]
+    avg_win = sum(wins) / len(wins) if wins else 0.0
+    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+
+    times = [f["time"] for f in fills if f.get("time")]
+    days = (max(times) - min(times)) / MS_DAY if times else 0
+
+    # حجم هر ورود (notional) نسبت به موجودی حساب در همان زمان
+    opens = {}
+    for f in fills:
+        if not str(f.get("dir", "")).startswith("Open"):
+            continue
+        key = (f.get("coin"), f.get("oid"))
+        notional = safe_float(f.get("px")) * safe_float(f.get("sz"))
+        t = f.get("time") or 0
+        prev = opens.get(key)
+        opens[key] = (
+            min(prev[0], t) if prev else t,
+            (prev[1] if prev else 0.0) + notional,
+        )
+
+    sizes = []
+    for t, notional in opens.values():
+        equity = value_near(av_ts, av_vals, t) if av_ts else None
+        if equity and equity > 0 and notional > 0:
+            sizes.append(notional / equity)
+    sizes.sort()
+
+    size_median = size_p90 = None
+    if len(sizes) >= 10:
+        size_median = sizes[len(sizes) // 2]
+        size_p90 = sizes[min(len(sizes) - 1, int(len(sizes) * 0.9))]
+
+    return {
+        "n": n,
+        "win_rate": len(wins) / n,
+        "rr": (avg_win / avg_loss) if avg_loss > 0 else None,
+        "days": days,
+        "per_day": n / max(days, 1),
+        "size_median": size_median,
+        "size_p90": size_p90,
+    }
+
+
+def trade_stats_str(r):
+    s = r.get("trade_stats")
+    if not s:
+        return "وین‌ریت: داده‌ی کافی نیست"
+    text = f"وین‌ریت: {s['win_rate']*100:.0f}% ({s['n']} معامله، {s['days']:.0f} روز اخیر)"
+    if s["rr"] is not None:
+        text += f" | میانگین سود/ضرر: {s['rr']:.2f}"
+    lines = [text, f"🔁 میانگین معامله در روز: {s['per_day']:.1f}"]
+    if s["size_median"] is not None:
+        lines.append(
+            f"💼 حجم هر ورود نسبت به موجودی: میانه {s['size_median']*100:.0f}% "
+            f"| ۹۰٪ ورودی‌ها زیر {s['size_p90']*100:.0f}%"
+        )
+    return "\n┃ ".join(lines)
+
+
 # ============================================================
 #                       انتخاب برترین‌ها
 # ============================================================
@@ -311,6 +408,7 @@ def select_top_traders(rows):
             print(f"   ✓ سن: {age_days} روز | موفق: {passing}/{MONTHS_TO_CHECK}")
             print(f"      {roi_list_str(monthly_rois)}")
 
+            c["av_ts"], c["av_vals"] = series[0], series[1]
             c["age_days"] = age_days
             c["monthly_rois"] = monthly_rois
             c["passing_months"] = passing
@@ -322,6 +420,20 @@ def select_top_traders(rows):
     analyzed.sort(key=lambda x: (x["passing_months"], x["all_roi"]), reverse=True)
     filtered = [c for c in analyzed if c["passing_months"] >= MIN_PASSING_TO_SHOW]
     print(f"تعداد تریدرهای با ≥ {MIN_PASSING_TO_SHOW} ماه موفق: {len(filtered)}")
+    # وین‌ریت فقط برای تریدرهای باقی‌مانده (تعداد درخواست اضافه کم است)
+    for c in filtered:
+        c["trade_stats"] = compute_trade_stats(
+            fetch_fills(c["address"]), c.get("av_ts"), c.get("av_vals")
+        )
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    if MIN_WIN_RATE is not None:
+        filtered = [
+            c for c in filtered
+            if c["trade_stats"] and c["trade_stats"]["win_rate"] >= MIN_WIN_RATE
+        ]
+        print(f"پس از فیلتر وین‌ریت ≥ {MIN_WIN_RATE*100:.0f}%: {len(filtered)}")
+
     return filtered[:LIMIT]
 
 
@@ -354,6 +466,8 @@ def build_card(i, r):
         f"┃ 💰 موجودی: ${r['account_value']:,.0f}  |  🎂 {r['age_days']} روز\n"
         f"┃\n"
         f"┃ 🎯 ماه‌های موفق: {r['passing_months']}/{MONTHS_TO_CHECK}\n"
+        f"┃\n"
+        f"┃ 📈 {trade_stats_str(r)}\n"
         f"┃\n"
         f"┃ 📅 روزانه : {roi_str(r['day_roi'])} · {pnl_str(r['day_pnl'])}\n"
         f"┃ 📆 هفتگی : {roi_str(r['week_roi'])} · {pnl_str(r['week_pnl'])}\n"
