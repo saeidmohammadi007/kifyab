@@ -1,4 +1,3 @@
-
 import os
 import time
 import calendar
@@ -20,8 +19,8 @@ MONTHLY_ROI_THRESHOLD = 0.05     # حداقل ROI هر ماه (۵٪)
 MONTHS_TO_CHECK = 12             # تعداد ماه‌های اخیر برای بررسی
 
 # ------------------ تنظیمات عملکرد ------------------
-TOP_BY_ALLTIME = 500             # ابتدا این تعداد از تریدرهای برتر را بررسی می‌کنیم
-SLEEP_BETWEEN_REQUESTS = 0.25    # مکث بین درخواست‌ها (ضد rate limit)
+TOP_BY_ALLTIME = 300             # تعداد کاندیدای اولیه برای بررسی عمیق
+SLEEP_BETWEEN_REQUESTS = 0.4     # مکث بین درخواست‌ها (ضد rate limit)
 
 
 # ============================================================
@@ -57,8 +56,9 @@ def fetch_portfolio(address):
         }, timeout=15)
         res.raise_for_status()
         return res.json()
-    except Exception:
-        return {}
+    except Exception as e:
+        print(f"   خطا در portfolio {address}: {e}")
+        return None
 
 
 def fetch_fills_by_time(address, start_ms, end_ms):
@@ -72,8 +72,12 @@ def fetch_fills_by_time(address, start_ms, end_ms):
             "aggregateByTime": False,
         }, timeout=20)
         res.raise_for_status()
-        return res.json()
-    except Exception:
+        data = res.json()
+        if not isinstance(data, list):
+            return None
+        return data
+    except Exception as e:
+        print(f"   خطا در fills {address}: {e}")
         return None
 
 
@@ -121,7 +125,6 @@ def vlm_str(vlm):
 #                    فیلترهای سبک (بدون API اضافه)
 # ============================================================
 def passes_light_filters(row):
-    """فیلترهای سریع روی داده leaderboard"""
     acc = safe_float(row.get("accountValue", 0))
     if acc < MIN_ACCOUNT_VALUE:
         return False
@@ -142,11 +145,42 @@ def get_account_age_days(address, portfolio_data=None):
     if portfolio_data is None:
         portfolio_data = fetch_portfolio(address)
 
-    pnl_history = portfolio_data.get("pnlHistory") or []
+    if not portfolio_data:
+        return 0
+
+    pnl_history = []
+
+    # حالت ۱: پاسخ به صورت list از جفت‌های [window, data]
+    if isinstance(portfolio_data, list):
+        # چک می‌کنیم که آیا خودش pnlHistory خام است یا آرایه‌ی windowها
+        if portfolio_data and isinstance(portfolio_data[0], list):
+            first = portfolio_data[0]
+            # فرمت خام [[t, v], [t, v], ...]
+            if (len(first) == 2
+                    and isinstance(first[0], (int, float))
+                    and isinstance(first[1], (int, float))):
+                pnl_history = portfolio_data
+            else:
+                # فرمت windowها: [["day", {...}], ["allTime", {...}], ...]
+                for item in portfolio_data:
+                    if (isinstance(item, list) and len(item) == 2
+                            and item[0] == "allTime"
+                            and isinstance(item[1], dict)):
+                        pnl_history = item[1].get("pnlHistory") or []
+                        break
+
+    # حالت ۲: پاسخ به صورت dict
+    elif isinstance(portfolio_data, dict):
+        pnl_history = portfolio_data.get("pnlHistory") or []
+
     if not pnl_history or not isinstance(pnl_history[0], list):
         return 0
 
-    first_activity_ms = pnl_history[0][0]
+    try:
+        first_activity_ms = pnl_history[0][0]
+    except (IndexError, TypeError):
+        return 0
+
     age_ms = time.time() * 1000 - first_activity_ms
     return int(age_ms / (1000 * 60 * 60 * 24))
 
@@ -159,8 +193,10 @@ def check_monthly_roi(address, current_account_value):
     now = datetime.utcnow()
     monthly_rois = []
 
+    if current_account_value <= 0:
+        return False, monthly_rois
+
     for i in range(MONTHS_TO_CHECK):
-        # محاسبه بازه ماه i-ام (i=0 یعنی ماه جاری)
         target = now - timedelta(days=30 * i)
         start = target.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         last_day = calendar.monthrange(target.year, target.month)[1]
@@ -177,11 +213,10 @@ def check_monthly_roi(address, current_account_value):
         if fills is None:
             return False, monthly_rois
 
-        monthly_pnl = sum(safe_float(f.get("closedPnl", 0)) for f in fills)
-
-        # اگر سرمایه فعلی صفر باشد نمی‌توان ROI محاسبه کرد
-        if current_account_value <= 0:
-            return False, monthly_rois
+        monthly_pnl = 0.0
+        for f in fills:
+            if isinstance(f, dict):
+                monthly_pnl += safe_float(f.get("closedPnl", 0))
 
         monthly_roi = monthly_pnl / current_account_value
         monthly_rois.append(monthly_roi)
@@ -220,7 +255,6 @@ def build_candidates(rows):
             "month_vlm": get_perf(row, "month", "vlm"),
         })
 
-    # فقط تریدرهایی که ROI کل‌دوره‌شان مثبت است
     candidates = [c for c in candidates if c["all_roi"] > 0]
     candidates.sort(key=lambda x: x["all_roi"], reverse=True)
     return candidates
@@ -257,26 +291,33 @@ def select_top_traders(rows, limit=LIMIT):
         checked += 1
         print(f"[{checked}/{len(pre_filtered)}] بررسی عمیق: {addr}")
 
-        # سن حساب
-        portfolio = fetch_portfolio(addr)
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        try:
+            portfolio = fetch_portfolio(addr)
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
 
-        age_days = get_account_age_days(addr, portfolio)
-        if age_days < MIN_AGE_DAYS:
-            print(f"   ✗ سن حساب کم: {age_days} روز")
+            age_days = get_account_age_days(addr, portfolio)
+            if age_days < MIN_AGE_DAYS:
+                print(f"   ✗ سن حساب کم: {age_days} روز")
+                continue
+
+            ok, monthly_rois = check_monthly_roi(addr, c["account_value"])
+            if not ok:
+                rois_txt = ", ".join(f"{r*100:+.1f}%" for r in monthly_rois)
+                print(f"   ✗ ROI ماهانه رد شد: [{rois_txt}]")
+                continue
+
+            c["age_days"] = age_days
+            c["monthly_rois"] = monthly_rois
+            c["min_monthly_roi"] = min(monthly_rois)
+            final.append(c)
+            print(
+                f"   ✓ قبول | سن: {age_days} روز | "
+                f"کمترین ROI ماهانه: {min(monthly_rois)*100:.1f}%"
+            )
+
+        except Exception as e:
+            print(f"   ✗ خطای نامشخص برای {addr}: {e}")
             continue
-
-        # ROI ماهانه
-        ok, monthly_rois = check_monthly_roi(addr, c["account_value"])
-        if not ok:
-            print(f"   ✗ ROI ماهانه رد شد: {[f'{r*100:.1f}%' for r in monthly_rois]}")
-            continue
-
-        c["age_days"] = age_days
-        c["monthly_rois"] = monthly_rois
-        c["min_monthly_roi"] = min(monthly_rois)
-        final.append(c)
-        print(f"   ✓ قبول شد | سن: {age_days} روز | کمترین ROI ماهانه: {min(monthly_rois)*100:.1f}%")
 
     return final
 
@@ -311,7 +352,7 @@ def build_message(records):
             f"┃ 🗓️ ماهانه : {roi_str(r['month_roi']):>10} · {pnl_str(r['month_pnl']):>12}\n"
             f"┃ 🏆 کل دوره: {roi_str(r['all_roi']):>10} · {pnl_str(r['all_pnl']):>12}\n"
             f"┃\n"
-            f"┃ 📊 ROI ماهانه ۱۲ ماه اخیر:\n"
+            f"┃ 📊 ROI ماهانه {MONTHS_TO_CHECK} ماه اخیر (جدید→قدیم):\n"
             f"┃    {monthly_str}\n"
             f"┗━━━━━━━━━━━━━━━━━━━━━\n\n"
         )
@@ -358,8 +399,8 @@ def main():
     if not final:
         send_telegram(
             f"⚠️ با فیلترهای فعلی (ROI ماهانه ≥ {MONTHLY_ROI_THRESHOLD*100:.0f}% "
-            f"برای {MONTHS_TO_CHECK} ماه) هیچ تریدری یافت نشد.\n"
-            f"پیشنهاد: آستانه را کاهش دهید یا تعداد ماه‌ها را کم کنید."
+            f"برای {MONTHS_TO_CHECK} ماه متوالی) هیچ تریدری یافت نشد.\n"
+            f"پیشنهاد: آستانه یا تعداد ماه‌ها را کاهش دهید."
         )
         return
 
