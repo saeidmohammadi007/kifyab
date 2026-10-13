@@ -24,6 +24,9 @@ MIN_MONTH_START_EQUITY = 500     # حداقل موجودی ابتدای ماه �
 MAX_ALLOWED_MONTH_LOSS = -0.30   # اگر ماهی بدتر از این بود حذف شود (None = غیرفعال)
 MAX_GAP_DAYS = 15                # حداکثر فاصله‌ی مجاز نقطه‌ی history تا مرز ماه
 
+REQUIRE_ALL_MONTHS_POSITIVE = True   # فقط تریدرهایی که همه ماه‌ها ROI مثبت دارند
+MIN_VALID_MONTHS = 10                # حداقل تعداد ماه با داده‌ی معتبر (ماه‌های بدون داده نادیده گرفته می‌شوند)
+
 # ------------------ تنظیمات عملکرد ------------------
 TOP_BY_ALLTIME = 500             # تعداد کاندیدای اولیه برای بررسی عمیق
 SLEEP_BETWEEN_REQUESTS = 0.4     # مکث بین درخواست‌ها
@@ -296,6 +299,15 @@ def select_top_traders(rows):
                 print("   ✗ ماه با ضرر شدید")
                 continue
 
+            if REQUIRE_ALL_MONTHS_POSITIVE:
+                valid = [r for r in monthly_rois if r is not None]
+                if len(valid) < MIN_VALID_MONTHS:
+                    print(f"   ✗ ماه‌های معتبر کم: {len(valid)}")
+                    continue
+                if any(r <= 0 for r in valid):
+                    print("   ✗ حداقل یک ماه منفی/صفر")
+                    continue
+
             print(f"   ✓ سن: {age_days} روز | موفق: {passing}/{MONTHS_TO_CHECK}")
             print(f"      {roi_list_str(monthly_rois)}")
 
@@ -327,7 +339,8 @@ def build_header(count):
         f"   • حجم معاملات هفته/ماه ≥ ${MIN_WEEK_VLM:,}\n"
         f"   • سابقه ≥ {MIN_AGE_DAYS} روز\n"
         f"   • حداقل {MIN_PASSING_TO_SHOW} ماه موفق برای نمایش\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + ("   • همه ماه‌ها ROI مثبت\n" if REQUIRE_ALL_MONTHS_POSITIVE else "")
+        + f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
 
