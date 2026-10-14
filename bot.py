@@ -23,15 +23,13 @@ MIN_MONTH_START_EQUITY = 20
 MIN_CLOSED_TRADES = 20
 MAX_COINS_FOR_LEVERAGE = 5
 MAX_GAP_DAYS = 15
+MAX_RR_CAP = 10.0                # سقف R:R برای جلوگیری از اثر داده‌های پرت
 
-# وزن هر معیار در امتیاز نهایی (هرچه بیشتر، مهم‌تر)
+# وزن هر معیار در امتیاز نهایی (مجموع = ۱)
 WEIGHTS = {
-    "profit6": 1.5,          # بیشترین سود ۶ ماه
-    "positive_months": 1.5,  # بیشترین ماه مثبت
-    "win_rate": 1.0,         # بیشترین وین‌ریت
-    "margin": 1.0,           # کمترین مارجین نسبت به سرمایه
-    "tradable": 1.0,         # بیشترین سهم کوین مشترک با البانک
-    "per_day": 0.5,          # کمترین معامله در روز
+    "win_rate": 0.35,            # وین‌ریت
+    "rr_ratio": 0.35,            # ریسک به ریوارد
+    "tradable": 0.30,            # سهم کوین‌های البانک
 }
 
 SLEEP_BETWEEN_REQUESTS = 0.3
@@ -308,7 +306,6 @@ def compute_monthly_rois(series):
 
 
 def compute_period_profit(series, monthly_rois):
-    """سود N ماه اخیر: ROI مرکب (از ماه‌های کامل) و PnL دلاری."""
     _, _, pnl_ts, pnl_vals = series
     recent = monthly_rois[:PROFIT_MONTHS]
     if len(recent) < PROFIT_MONTHS or any(r is None for r in recent):
@@ -330,9 +327,14 @@ def compute_period_profit(series, monthly_rois):
 
 
 # ============================================================
-#                تحلیل معاملات
+#                تحلیل معاملات (نسخه جدید)
 # ============================================================
-def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
+def compute_trade_stats(fills):
+    """
+    محاسبه آمار معاملات شامل وین‌ریت و ریسک به ریوارد.
+    - PnL خالص هر معامله = closedPnl - fee
+    - R:R = میانگین سود معاملات برنده / میانگین ضرر معاملات بازنده
+    """
     groups = {}
     for f in fills:
         closed = safe_float(f.get("closedPnl"))
@@ -348,57 +350,38 @@ def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
         return None
 
     wins = [x for x in nets if x > 0]
-    win_rate = len(wins) / n
+    losses = [x for x in nets if x < 0]
+
+    win_rate = len(wins) / n if n > 0 else 0.0
+
+    avg_win = sum(wins) / len(wins) if wins else 0.0
+    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+
+    # محاسبه R:R با محدودیت سقف
+    if avg_loss > 0:
+        rr_ratio = min(avg_win / avg_loss, MAX_RR_CAP)
+    else:
+        rr_ratio = MAX_RR_CAP if avg_win > 0 else 0.0
 
     times = [f["time"] for f in fills if f.get("time")]
     days = (max(times) - min(times)) / MS_DAY if times else 0
     per_day = n / max(days, 1)
 
-    opens = {}
-    for f in fills:
-        if not str(f.get("dir", "")).startswith("Open"):
-            continue
-        key = (f.get("coin"), f.get("oid"))
-        notional = safe_float(f.get("px")) * safe_float(f.get("sz"))
-        t = f.get("time") or 0
-        prev = opens.get(key)
-        opens[key] = (
-            min(prev[0], t) if prev else t,
-            (prev[1] if prev else 0.0) + notional,
-        )
-
-    sizes = []
-    for (coin, _oid), (t, notional) in opens.items():
-        lev = (lev_map or {}).get(coin)
-        if not lev:
-            continue
-        equity = value_near(av_ts, av_vals, t) if av_ts else None
-        if equity and equity > 0 and notional > 0:
-            sizes.append((notional / lev) / equity)
-    sizes.sort()
-
-    size_median = size_p90 = size_max = None
-    if len(sizes) >= 5:
-        size_median = sizes[len(sizes) // 2]
-        size_max = sizes[-1]
-        size_p90 = sizes[min(len(sizes) - 1, int(len(sizes) * 0.9))]
-
     return {
         "n": n,
         "win_rate": win_rate,
+        "rr_ratio": rr_ratio,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
         "days": days,
         "per_day": per_day,
-        "size_median": size_median,
-        "size_p90": size_p90,
-        "size_max": size_max,
     }
 
 
 # ============================================================
-#                امتیازدهی چندمعیاره
+#                امتیازدهی چندمعیاره (جدید)
 # ============================================================
 def rank_scores(values, higher_better=True):
-    """امتیاز ۰ تا ۱ بر اساس رتبه؛ بهترین = ۱."""
     n = len(values)
     if n <= 1:
         return [1.0] * n
@@ -411,12 +394,9 @@ def rank_scores(values, higher_better=True):
 
 def score_traders(records):
     metrics = {
-        "profit6": ([r["roi_6m"] for r in records], True),
-        "positive_months": ([r["positive_months"] for r in records], True),
         "win_rate": ([r["trade_stats"]["win_rate"] for r in records], True),
-        "margin": ([r["trade_stats"]["size_p90"] for r in records], False),
+        "rr_ratio": ([r["trade_stats"]["rr_ratio"] for r in records], True),
         "tradable": ([r["tradable_share"] for r in records], True),
-        "per_day": ([r["trade_stats"]["per_day"] for r in records], False),
     }
     total_w = sum(WEIGHTS.values())
     for r in records:
@@ -476,12 +456,11 @@ def select_top_traders(rows):
             if not series:
                 continue
 
-            # فیلتر سابقه (قبل از درخواست‌های سنگین‌تر)
+            # فیلتر سابقه
             c["age_days"] = int((time.time() * 1000 - series[2][0]) / MS_DAY)
             if c["age_days"] < MIN_AGE_DAYS:
                 continue
 
-            c["av_ts"], c["av_vals"] = series[0], series[1]
             monthly_rois, positive = compute_monthly_rois(series)
             c["monthly_rois"] = monthly_rois
             c["positive_months"] = positive
@@ -499,12 +478,11 @@ def select_top_traders(rows):
             c["tradable_share"] = tradable_share(fills)
 
             cfills = [f for f in fills if coin_ok(f.get("coin"))]
-            lev_map = fetch_leverage_map(addr, cfills) if cfills else {}
+            if not cfills:
+                continue
 
-            ts = compute_trade_stats(
-                cfills, c["av_ts"], c["av_vals"], lev_map
-            )
-            if not ts or ts.get("size_p90") is None:
+            ts = compute_trade_stats(cfills)
+            if not ts:
                 continue
             c["trade_stats"] = ts
             analyzed.append(c)
@@ -519,15 +497,14 @@ def select_top_traders(rows):
 
 
 # ============================================================
-#                ساخت پیام
+#                ساخت پیام (به‌روزشده)
 # ============================================================
 def build_header(count):
     return (
         f"🏆 {count} کیف پول برتر Hyperliquid\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 حداقل سابقه {MIN_AGE_DAYS // 30} ماه | امتیاز بر اساس: "
-        f"سود {PROFIT_MONTHS} ماه، ماه‌های مثبت، وین‌ریت، "
-        f"کمترین مارجین، کوین‌های البانک، کمترین معامله در روز\n"
+        f"وین‌ریت ۳۵٪ + ریسک به ریوارد ۳۵٪ + کوین‌های البانک ۳۰٪\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
@@ -543,20 +520,23 @@ def build_card(i, r):
         for x in (r.get("monthly_rois") or [])
     )
 
+    # نمایش R:R با محدودیت سقف
+    rr_display = f"{ts['rr_ratio']:.2f}" if ts['rr_ratio'] < MAX_RR_CAP else f"> {MAX_RR_CAP:.0f}"
+
     return (
         f"┏━━━━━━━━━━━━━━━━━━━━━\n"
         f"┃ {medal}#{i}{name_part}  ⭐ {r['score']:.0f}/100\n"
         f"┃ 🔗 {r['address']}\n"
         f"┃ 💰 موجودی: ${r['account_value']:,.0f}  |  🎂 {r['age_days']} روز\n"
         f"┃\n"
+        f"┃ 📈 وین‌ریت: {ts['win_rate']*100:.0f}% ({ts['n']} معامله)\n"
+        f"┃ ⚖️ ریسک به ریوارد: {rr_display}\n"
+        f"┃    میانگین سود: {pnl_str(ts['avg_win'])} | میانگین ضرر: -${ts['avg_loss']:,.0f}\n"
+        f"┃ 🏦 سهم کوین‌های البانک: {r['tradable_share']*100:.0f}%\n"
+        f"┃\n"
         f"┃ 💵 سود {PROFIT_MONTHS} ماه: {roi_str(r['roi_6m'])} ({pnl6})\n"
         f"┃ ✅ ماه‌های مثبت: {r['positive_months']}/{MONTHS_TO_CHECK}\n"
-        f"┃ 📈 وین‌ریت: {ts['win_rate']*100:.0f}% ({ts['n']} معامله)\n"
-        f"┃ 💼 مارجین هر ورود: میانه {ts['size_median']*100:.1f}% "
-        f"| ۹۰٪ زیر {ts['size_p90']*100:.1f}% "
-        f"| حداکثر {ts['size_max']*100:.1f}%\n"
         f"┃ 🔁 معامله در روز: {ts['per_day']:.1f}\n"
-        f"┃ 🏦 سهم کوین‌های البانک: {r['tradable_share']*100:.0f}%\n"
         f"┃\n"
         f"┃ 📅 سود هر ماه (جدید → قدیم):\n"
         f"┃    {rois_line}\n"
