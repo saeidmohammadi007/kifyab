@@ -17,7 +17,7 @@ TOP_CANDIDATES = 500             # تعداد تریدر برتر بر اساس 
 MONTHS_TO_CHECK = 12             # تعداد ماه‌های کامل اخیر برای شمارش
 PROFIT_MONTHS = 6                # بازه‌ی محاسبه‌ی سود (ماه)
 
-MIN_AGE_DAYS = 180               # ✅ حداقل سابقه ۶ ماه
+MIN_AGE_DAYS = 365               # ✅ حداقل سابقه ۱۲ ماه
 MIN_VALID_MONTHS = 5             # حداقل ۵ ماه داده‌ی معتبر (برای نسبت معنادار)
 
 MIN_ACCOUNT_VALUE = 0
@@ -432,7 +432,7 @@ def select_top_traders(rows):
             if not series:
                 continue
 
-            # فیلتر سابقه (≥ ۶ ماه)
+            # فیلتر سابقه (≥ ۱۲ ماه)
             c["age_days"] = int((time.time() * 1000 - series[2][0]) / MS_DAY)
             if c["age_days"] < MIN_AGE_DAYS:
                 skipped_age += 1
