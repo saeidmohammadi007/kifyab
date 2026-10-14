@@ -35,7 +35,7 @@ MIN_WIN_RATE = None                  # مثلاً 0.5 یعنی فقط وین‌�
 MIN_VALID_MONTHS = 10                # حداقل تعداد ماه با داده‌ی معتبر (ماه‌های بدون داده نادیده گرفته می‌شوند)
 
 # ------------------ فیلترهای قابل‌کپی در البانک ------------------
-MIN_TRADABLE_SHARE = 0.90            # حداقل سهم حجم معاملات روی کوین‌های موجود در البانک (None = غیرفعال)
+MIN_TRADABLE_SHARE = 0.50            # حداقل سهم حجم معاملات روی کوین‌های موجود در البانک (None = غیرفعال)
 MIN_MEDIAN_HOLD_MINUTES = None       # حداقل میانه‌ی مدت نگه‌داری پوزیشن، به دقیقه (None = غیرفعال)
 MAX_TRADES_PER_DAY = None            # حداکثر معامله‌ی بسته‌شده در روز روی کوین‌های قابل‌کپی (None = غیرفعال)
 MAX_LEVERAGE_ALLOWED = None          # حداکثر اهرم فعلی روی کوین‌های پرمعامله (None = غیرفعال)
@@ -593,13 +593,13 @@ def select_top_traders(rows):
         fills = fetch_fills(addr)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
         if not fills:
-            print(f"   ✗ {addr[:10]}… fill ندارد")
+            print(f"   ✗ {addr} fill ندارد")
             continue
 
         share = tradable_share(fills)
         c["tradable_share"] = share
         if MIN_TRADABLE_SHARE is not None and share < MIN_TRADABLE_SHARE:
-            print(f"   ✗ {addr[:10]}… سهم کوین قابل‌کپی کم: {share*100:.0f}%")
+            print(f"   ✗ {addr} سهم کوین قابل‌کپی کم: {share*100:.0f}%")
             continue
 
         # از اینجا به بعد فقط fillهای کوین‌های قابل‌کپی حساب می‌شوند
@@ -609,14 +609,14 @@ def select_top_traders(rows):
         if MIN_MEDIAN_HOLD_MINUTES is not None:
             if not c["hold"] or c["hold"]["median_min"] < MIN_MEDIAN_HOLD_MINUTES:
                 got = f"{c['hold']['median_min']:.0f}" if c["hold"] else "نامشخص"
-                print(f"   ✗ {addr[:10]}… نگه‌داری کوتاه: میانه {got} دقیقه")
+                print(f"   ✗ {addr} نگه‌داری کوتاه: میانه {got} دقیقه")
                 continue
 
         lev_map = fetch_leverage_map(addr, cfills)
         c["max_lev"] = max(lev_map.values()) if lev_map else None
         if (MAX_LEVERAGE_ALLOWED is not None and c["max_lev"] is not None
                 and c["max_lev"] > MAX_LEVERAGE_ALLOWED):
-            print(f"   ✗ {addr[:10]}… اهرم بالا: {c['max_lev']:.0f}x")
+            print(f"   ✗ {addr} اهرم بالا: {c['max_lev']:.0f}x")
             continue
 
         c["trade_stats"] = compute_trade_stats(
@@ -626,7 +626,7 @@ def select_top_traders(rows):
 
         s = c["trade_stats"]
         if MAX_TRADES_PER_DAY is not None and s and s["per_day"] > MAX_TRADES_PER_DAY:
-            print(f"   ✗ {addr[:10]}… معامله‌ی زیاد: {s['per_day']:.1f} در روز")
+            print(f"   ✗ {addr} معامله‌ی زیاد: {s['per_day']:.1f} در روز")
             continue
 
         kept.append(c)
