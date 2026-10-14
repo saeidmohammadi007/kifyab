@@ -1,7 +1,6 @@
 import os
 import time
 from bisect import bisect_left
-from collections import defaultdict
 from datetime import datetime, timezone
 
 import requests
@@ -13,21 +12,31 @@ LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO_URL = "https://api.hyperliquid.xyz/info"
 
 # ------------------ تنظیمات ------------------
-LIMIT = 100                      # تعداد تریدر نمایش داده‌شده
+LIMIT = 20                       # تعداد تریدر نمایش داده‌شده
 TOP_BY_ALLTIME = 500             # تعداد کاندیدای اولیه برای بررسی عمیق
-MONTHS_TO_CHECK = 12             # تعداد ماه‌های کامل اخیر برای بررسی
-MONTHLY_ROI_THRESHOLD = 0.05     # آستانه‌ی ROI مثبت/موفق هر ماه (۵٪)
+MONTHS_TO_CHECK = 12             # تعداد ماه‌های کامل اخیر برای شمارش ماه مثبت
+PROFIT_MONTHS = 6                # بازه‌ی محاسبه‌ی سود (ماه)
+MIN_AGE_DAYS = 180               # حداقل سابقه (۶ ماه)
 MIN_ACCOUNT_VALUE = 0
-MIN_WEEK_VLM = 1000              # حداقل حجم معاملات هفته/ماه
-MIN_MONTH_START_EQUITY = 20      # حداقل موجودی ابتدای ماه
-MIN_CLOSED_TRADES = 20           # حداقل معامله‌ی بسته برای وین‌ریت
-MAX_COINS_FOR_LEVERAGE = 5       # اهرم فقط برای N کوین پرمعامله گرفته می‌شود
-MAX_GAP_DAYS = 15                # حداکثر فاصله‌ی نقطه‌ی history تا مرز ماه
+MIN_WEEK_VLM = 1000
+MIN_MONTH_START_EQUITY = 20
+MIN_CLOSED_TRADES = 20
+MAX_COINS_FOR_LEVERAGE = 5
+MAX_GAP_DAYS = 15
+
+# وزن هر معیار در امتیاز نهایی (هرچه بیشتر، مهم‌تر)
+WEIGHTS = {
+    "profit6": 1.5,          # بیشترین سود ۶ ماه
+    "positive_months": 1.5,  # بیشترین ماه مثبت
+    "win_rate": 1.0,         # بیشترین وین‌ریت
+    "margin": 1.0,           # کمترین مارجین نسبت به سرمایه
+    "tradable": 1.0,         # بیشترین سهم کوین مشترک با البانک
+    "per_day": 0.5,          # کمترین معامله در روز
+}
 
 SLEEP_BETWEEN_REQUESTS = 0.3
 MAX_RETRIES = 4
 
-# کوین‌های فیوچرز البانک
 LBANK_COINS_FILE = os.getenv("LBANK_COINS_FILE", "lbank_coins.txt")
 LBANK_COINS = set()
 
@@ -298,6 +307,28 @@ def compute_monthly_rois(series):
     return rois, positive
 
 
+def compute_period_profit(series, monthly_rois):
+    """سود N ماه اخیر: ROI مرکب (از ماه‌های کامل) و PnL دلاری."""
+    _, _, pnl_ts, pnl_vals = series
+    recent = monthly_rois[:PROFIT_MONTHS]
+    if len(recent) < PROFIT_MONTHS or any(r is None for r in recent):
+        return None, None
+
+    compound = 1.0
+    for r in recent:
+        compound *= (1 + r)
+    roi_6m = compound - 1
+
+    now = datetime.now(timezone.utc)
+    cur_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    s_ms = int(shift_month(cur_month, -PROFIT_MONTHS).timestamp() * 1000)
+    e_ms = int(cur_month.timestamp() * 1000)
+    p_start = value_near(pnl_ts, pnl_vals, s_ms)
+    p_end = value_near(pnl_ts, pnl_vals, e_ms)
+    pnl_6m = (p_end - p_start) if (p_start is not None and p_end is not None) else None
+    return roi_6m, pnl_6m
+
+
 # ============================================================
 #                تحلیل معاملات
 # ============================================================
@@ -323,7 +354,6 @@ def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
     days = (max(times) - min(times)) / MS_DAY if times else 0
     per_day = n / max(days, 1)
 
-    # حجم هر ورود (notional) نسبت به موجودی
     opens = {}
     for f in fills:
         if not str(f.get("dir", "")).startswith("Open"):
@@ -365,6 +395,44 @@ def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
 
 
 # ============================================================
+#                امتیازدهی چندمعیاره
+# ============================================================
+def rank_scores(values, higher_better=True):
+    """امتیاز ۰ تا ۱ بر اساس رتبه؛ بهترین = ۱."""
+    n = len(values)
+    if n <= 1:
+        return [1.0] * n
+    order = sorted(range(n), key=lambda i: values[i], reverse=higher_better)
+    scores = [0.0] * n
+    for pos, i in enumerate(order):
+        scores[i] = 1 - pos / (n - 1)
+    return scores
+
+
+def score_traders(records):
+    metrics = {
+        "profit6": ([r["roi_6m"] for r in records], True),
+        "positive_months": ([r["positive_months"] for r in records], True),
+        "win_rate": ([r["trade_stats"]["win_rate"] for r in records], True),
+        "margin": ([r["trade_stats"]["size_p90"] for r in records], False),
+        "tradable": ([r["tradable_share"] for r in records], True),
+        "per_day": ([r["trade_stats"]["per_day"] for r in records], False),
+    }
+    total_w = sum(WEIGHTS.values())
+    for r in records:
+        r["score"] = 0.0
+    for name, (vals, higher) in metrics.items():
+        sc = rank_scores(vals, higher)
+        w = WEIGHTS.get(name, 0)
+        for r, s in zip(records, sc):
+            r["score"] += w * s
+    for r in records:
+        r["score"] = r["score"] / total_w * 100
+    records.sort(key=lambda r: r["score"], reverse=True)
+    return records
+
+
+# ============================================================
 #                انتخاب تریدرهای برتر
 # ============================================================
 def select_top_traders(rows):
@@ -388,13 +456,7 @@ def select_top_traders(rows):
             "address": addr,
             "display_name": row.get("displayName") or "",
             "account_value": av,
-            "day_roi": get_perf(row, "day", "roi"),
-            "week_roi": get_perf(row, "week", "roi"),
-            "month_roi": get_perf(row, "month", "roi"),
             "all_roi": all_roi,
-            "day_pnl": get_perf(row, "day", "pnl"),
-            "week_pnl": get_perf(row, "week", "pnl"),
-            "month_pnl": get_perf(row, "month", "pnl"),
             "all_pnl": get_perf(row, "allTime", "pnl"),
         })
 
@@ -414,46 +476,46 @@ def select_top_traders(rows):
             if not series:
                 continue
 
-            c["av_ts"], c["av_vals"] = series[0], series[1]
+            # فیلتر سابقه (قبل از درخواست‌های سنگین‌تر)
             c["age_days"] = int((time.time() * 1000 - series[2][0]) / MS_DAY)
+            if c["age_days"] < MIN_AGE_DAYS:
+                continue
 
+            c["av_ts"], c["av_vals"] = series[0], series[1]
             monthly_rois, positive = compute_monthly_rois(series)
             c["monthly_rois"] = monthly_rois
             c["positive_months"] = positive
-            valid = [r for r in monthly_rois if r is not None]
-            c["avg_monthly_roi"] = (sum(valid) / len(valid)) if valid else None
+
+            roi_6m, pnl_6m = compute_period_profit(series, monthly_rois)
+            if roi_6m is None:
+                continue
+            c["roi_6m"], c["pnl_6m"] = roi_6m, pnl_6m
 
             fills = fetch_fills(addr)
             time.sleep(SLEEP_BETWEEN_REQUESTS)
-
             if not fills:
-                c["tradable_share"] = 0.0
-                c["trade_stats"] = None
-                c["max_lev"] = None
-                analyzed.append(c)
                 continue
 
             c["tradable_share"] = tradable_share(fills)
+
             cfills = [f for f in fills if coin_ok(f.get("coin"))]
-
             lev_map = fetch_leverage_map(addr, cfills) if cfills else {}
-            c["max_lev"] = max(lev_map.values()) if lev_map else None
 
-            c["trade_stats"] = compute_trade_stats(
-                cfills, c.get("av_ts"), c.get("av_vals"), lev_map
+            ts = compute_trade_stats(
+                cfills, c["av_ts"], c["av_vals"], lev_map
             )
+            if not ts or ts.get("size_p90") is None:
+                continue
+            c["trade_stats"] = ts
             analyzed.append(c)
 
         except Exception as e:
             print(f"   ✗ خطا: {e}")
 
-    # مرتب‌سازی: اول تعداد ماه مثبت، بعد ROI کل
-    analyzed.sort(
-        key=lambda x: (x.get("positive_months", 0), x["all_roi"]),
-        reverse=True,
-    )
-    print(f"تعداد تحلیل‌شده: {len(analyzed)}")
-    return analyzed[:LIMIT]
+    print(f"واجد شرایط: {len(analyzed)}")
+    if not analyzed:
+        return []
+    return score_traders(analyzed)[:LIMIT]
 
 
 # ============================================================
@@ -461,11 +523,11 @@ def select_top_traders(rows):
 # ============================================================
 def build_header(count):
     return (
-        f"🏆 {count} تریدر برتر Hyperliquid\n"
+        f"🏆 {count} کیف پول برتر Hyperliquid\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 معیارها: ماه‌های مثبت (از {MONTHS_TO_CHECK} ماه اخیر)، "
-        f"وین‌ریت، معاملات روزانه، مارجین هر ورود، "
-        f"سود ماهانه و سهم کوین‌های البانک\n"
+        f"📊 حداقل سابقه {MIN_AGE_DAYS // 30} ماه | امتیاز بر اساس: "
+        f"سود {PROFIT_MONTHS} ماه، ماه‌های مثبت، وین‌ریت، "
+        f"کمترین مارجین، کوین‌های البانک، کمترین معامله در روز\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
@@ -473,47 +535,31 @@ def build_header(count):
 def build_card(i, r):
     name_part = f" ({r['display_name']})" if r["display_name"] else ""
     medal = {1: "🥇 ", 2: "🥈 ", 3: "🥉 "}.get(i, "")
+    ts = r["trade_stats"]
 
-    ts = r.get("trade_stats")
-    if ts:
-        win_line = f"📈 وین‌ریت: {ts['win_rate']*100:.0f}% ({ts['n']} معامله)"
-        perday_line = f"🔁 میانگین معامله در روز: {ts['per_day']:.1f}"
-        if ts.get("size_median") is not None:
-            margin_line = (
-                f"💼 مارجین هر ورود: میانه {ts['size_median']*100:.1f}% "
-                f"| ۹۰٪ زیر {ts['size_p90']*100:.1f}% "
-                f"| حداکثر {ts['size_max']*100:.1f}%"
-            )
-        else:
-            margin_line = "💼 مارجین هر ورود: داده‌ی کافی نیست"
-    else:
-        win_line = "📈 وین‌ریت: داده‌ی کافی نیست"
-        perday_line = "🔁 میانگین معامله در روز: —"
-        margin_line = "💼 مارجین هر ورود: —"
-
-    avg_monthly = r.get("avg_monthly_roi")
-    avg_line = f"{avg_monthly*100:+.1f}%" if avg_monthly is not None else "—"
-
-    rois = r.get("monthly_rois") or []
+    pnl6 = pnl_str(r["pnl_6m"]) if r.get("pnl_6m") is not None else "—"
     rois_line = " · ".join(
-        f"{x*100:+.1f}%" if x is not None else "—" for x in rois
+        f"{x*100:+.1f}%" if x is not None else "—"
+        for x in (r.get("monthly_rois") or [])
     )
 
     return (
         f"┏━━━━━━━━━━━━━━━━━━━━━\n"
-        f"┃ {medal}#{i}{name_part}\n"
+        f"┃ {medal}#{i}{name_part}  ⭐ {r['score']:.0f}/100\n"
         f"┃ 🔗 {r['address']}\n"
         f"┃ 💰 موجودی: ${r['account_value']:,.0f}  |  🎂 {r['age_days']} روز\n"
         f"┃\n"
+        f"┃ 💵 سود {PROFIT_MONTHS} ماه: {roi_str(r['roi_6m'])} ({pnl6})\n"
         f"┃ ✅ ماه‌های مثبت: {r['positive_months']}/{MONTHS_TO_CHECK}\n"
-        f"┃ {win_line}\n"
-        f"┃ {perday_line}\n"
-        f"┃ {margin_line}\n"
+        f"┃ 📈 وین‌ریت: {ts['win_rate']*100:.0f}% ({ts['n']} معامله)\n"
+        f"┃ 💼 مارجین هر ورود: میانه {ts['size_median']*100:.1f}% "
+        f"| ۹۰٪ زیر {ts['size_p90']*100:.1f}% "
+        f"| حداکثر {ts['size_max']*100:.1f}%\n"
+        f"┃ 🔁 معامله در روز: {ts['per_day']:.1f}\n"
         f"┃ 🏦 سهم کوین‌های البانک: {r['tradable_share']*100:.0f}%\n"
         f"┃\n"
         f"┃ 📅 سود هر ماه (جدید → قدیم):\n"
         f"┃    {rois_line}\n"
-        f"┃ 📊 میانگین سود ماهانه: {avg_line}\n"
         f"┃ 🏆 ROI کل: {roi_str(r['all_roi'])} | PnL: {pnl_str(r['all_pnl'])}\n"
         f"┗━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
@@ -575,7 +621,7 @@ def main():
     print(f"تعداد نهایی: {len(final)}")
 
     if not final:
-        send_telegram("⚠️ هیچ تریدری برای نمایش یافت نشد.")
+        send_telegram("⚠️ هیچ تریدری با این شرایط یافت نشد.")
         return
 
     send_telegram(build_chunks(final))
