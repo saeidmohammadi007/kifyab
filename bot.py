@@ -1,6 +1,7 @@
 import os
 import time
 from bisect import bisect_left
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import requests
@@ -32,6 +33,17 @@ MAX_COINS_FOR_LEVERAGE = 8           # اهرم فقط برای این تعدا�
 SIZE_METRIC = "max"                  # "max" = هر ورود، "p90" = ۹۰٪ ورودی‌ها، "median" = میانه
 MIN_WIN_RATE = None                  # مثلاً 0.5 یعنی فقط وین‌ریت ≥ ۵۰٪ (None = بدون فیلتر)
 MIN_VALID_MONTHS = 10                # حداقل تعداد ماه با داده‌ی معتبر (ماه‌های بدون داده نادیده گرفته می‌شوند)
+
+# ------------------ فیلترهای قابل‌کپی در البانک ------------------
+MIN_TRADABLE_SHARE = 0.90            # حداقل سهم حجم معاملات روی کوین‌های موجود در البانک (None = غیرفعال)
+MIN_MEDIAN_HOLD_MINUTES = None       # حداقل میانه‌ی مدت نگه‌داری پوزیشن، به دقیقه (None = غیرفعال)
+MAX_TRADES_PER_DAY = None            # حداکثر معامله‌ی بسته‌شده در روز روی کوین‌های قابل‌کپی (None = غیرفعال)
+MAX_LEVERAGE_ALLOWED = None          # حداکثر اهرم فعلی روی کوین‌های پرمعامله (None = غیرفعال)
+MIN_HOLD_SAMPLES = 5                 # حداقل تعداد پوزیشن کامل برای محاسبه‌ی مدت نگه‌داری
+
+# فهرست کوین‌های فیوچرز البانک: اول از ccxt، اگر نشد از این فایل (کوین‌ها با کاما یا خط جدید)
+LBANK_COINS_FILE = os.getenv("LBANK_COINS_FILE", "lbank_coins.txt")
+LBANK_COINS = set()                  # در main پر می‌شود
 
 # ------------------ تنظیمات عملکرد ------------------
 TOP_BY_ALLTIME = 500             # تعداد کاندیدای اولیه برای بررسی عمیق
@@ -99,6 +111,72 @@ def pnl_str(pnl):
 
 def roi_list_str(rois):
     return " · ".join(f"{x*100:+.1f}%" if x is not None else "—" for x in rois)
+
+
+def fmt_minutes(m):
+    if m < 60:
+        return f"{m:.0f} دقیقه"
+    if m < 1440:
+        return f"{m / 60:.1f} ساعت"
+    return f"{m / 1440:.1f} روز"
+
+
+# ============================================================
+#                  قابل‌کپی بودن کوین‌ها در البانک
+# ============================================================
+def load_lbank_coins():
+    """مجموعه‌ی کوین‌های فیوچرز USDT البانک. اگر ccxt جواب نداد از فایل می‌خواند."""
+    coins = set()
+    try:
+        import ccxt
+        ex = ccxt.lbank({"options": {"defaultType": "swap"}})
+        ex.load_markets()
+        for m in ex.markets.values():
+            if m.get("swap") and m.get("quote") == "USDT" and m.get("base"):
+                coins.add(str(m["base"]).upper())
+        print(f"ccxt: {len(coins)} کوین فیوچرز از البانک خوانده شد")
+    except Exception as e:
+        print(f"خواندن بازارهای البانک با ccxt ناموفق بود: {e}")
+
+    if not coins and os.path.exists(LBANK_COINS_FILE):
+        with open(LBANK_COINS_FILE, encoding="utf-8") as fh:
+            raw = fh.read().replace("\n", ",")
+        coins = {x.strip().upper() for x in raw.split(",") if x.strip()}
+        print(f"فایل {LBANK_COINS_FILE}: {len(coins)} کوین")
+
+    if not coins:
+        print("⚠️ فهرست کوین‌های البانک در دسترس نیست؛ فقط فیلتر ساختاری "
+              "(بدون ':' و '@' و '/') اعمال می‌شود. فایل lbank_coins.txt بسازید.")
+    return coins
+
+
+def is_plain_perp(coin):
+    """کوین معمولی هایپرلیکویید: نه بازار HIP-3 (با ':')، نه اسپات (@ یا /)"""
+    c = str(coin or "")
+    return bool(c) and ":" not in c and not c.startswith("@") and "/" not in c
+
+
+def coin_ok(coin):
+    if not is_plain_perp(coin):
+        return False
+    if not LBANK_COINS:
+        return True
+    c = str(coin)
+    candidates = {c.upper()}
+    if len(c) > 1 and c[0] == "k" and c[1].isupper():   # kPEPE -> 1000PEPE
+        candidates.add("1000" + c[1:].upper())
+    return bool(candidates & LBANK_COINS)
+
+
+def tradable_share(fills):
+    """سهم حجم دلاری فیل‌هایی که روی کوین قابل‌کپی بوده‌اند"""
+    total = ok = 0.0
+    for f in fills:
+        notional = safe_float(f.get("px")) * safe_float(f.get("sz"))
+        total += notional
+        if coin_ok(f.get("coin")):
+            ok += notional
+    return (ok / total) if total > 0 else 0.0
 
 
 # ============================================================
@@ -277,6 +355,47 @@ def fetch_leverage_map(address, fills):
     return result
 
 
+def compute_hold_stats(fills):
+    """
+    مدت نگه‌داری پوزیشن‌های کامل (از صفر تا صفر یا برگشت جهت) با startPosition هر fill.
+    پوزیشن‌هایی که قبل از شروع پنجره‌ی fillها باز بوده‌اند نادیده گرفته می‌شوند.
+    """
+    by_coin = defaultdict(list)
+    for f in fills:
+        by_coin[f.get("coin")].append(f)
+
+    holds = []
+    for _coin, fs in by_coin.items():
+        fs.sort(key=lambda x: x.get("time") or 0)
+        open_t = None
+        for f in fs:
+            start = safe_float(f.get("startPosition"))
+            sz = safe_float(f.get("sz"))
+            end = start + sz if f.get("side") == "B" else start - sz
+            t = f.get("time") or 0
+            tiny = max(abs(start), sz) * 1e-6
+
+            start_flat = abs(start) <= tiny
+            end_flat = abs(end) <= tiny
+            flipped = (not start_flat) and (not end_flat) and (start * end < 0)
+
+            if open_t is not None and (end_flat or flipped):
+                holds.append(t - open_t)
+                open_t = None
+            if (not end_flat) and (start_flat or flipped):
+                open_t = t
+
+    if len(holds) < MIN_HOLD_SAMPLES:
+        return None
+    holds.sort()
+    minutes = [h / 60000 for h in holds]
+    return {
+        "n": len(minutes),
+        "median_min": minutes[len(minutes) // 2],
+        "avg_min": sum(minutes) / len(minutes),
+    }
+
+
 def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
     """
     وین‌ریت بر اساس معاملات بسته‌شده. fillهای یک سفارش (oid) یک معامله حساب
@@ -361,6 +480,11 @@ def trade_stats_str(r):
             f"| حداکثر {s['size_max']*100:.1f}%"
         )
     return "\n┃ ".join(lines)
+
+
+def copy_info_str(r):
+    """خلاصه‌ی قابل‌کپی بودن برای البانک"""
+    return f"✅ سهم حجم روی کوین‌های موجود در البانک: {r['tradable_share']*100:.0f}%"
 
 
 # ============================================================
@@ -461,15 +585,54 @@ def select_top_traders(rows):
     analyzed.sort(key=lambda x: (x["passing_months"], x["all_roi"]), reverse=True)
     filtered = [c for c in analyzed if c["passing_months"] >= MIN_PASSING_TO_SHOW]
     print(f"تعداد تریدرهای با ≥ {MIN_PASSING_TO_SHOW} ماه موفق: {len(filtered)}")
-    # وین‌ریت فقط برای تریدرهای باقی‌مانده (تعداد درخواست اضافه کم است)
+
+    # ---------- بررسی fillها و فیلترهای قابل‌کپی در البانک ----------
+    kept = []
     for c in filtered:
-        fills = fetch_fills(c["address"])
+        addr = c["address"]
+        fills = fetch_fills(addr)
         time.sleep(SLEEP_BETWEEN_REQUESTS)
-        lev_map = fetch_leverage_map(c["address"], fills)
+        if not fills:
+            print(f"   ✗ {addr[:10]}… fill ندارد")
+            continue
+
+        share = tradable_share(fills)
+        c["tradable_share"] = share
+        if MIN_TRADABLE_SHARE is not None and share < MIN_TRADABLE_SHARE:
+            print(f"   ✗ {addr[:10]}… سهم کوین قابل‌کپی کم: {share*100:.0f}%")
+            continue
+
+        # از اینجا به بعد فقط fillهای کوین‌های قابل‌کپی حساب می‌شوند
+        cfills = [f for f in fills if coin_ok(f.get("coin"))]
+
+        c["hold"] = compute_hold_stats(cfills)
+        if MIN_MEDIAN_HOLD_MINUTES is not None:
+            if not c["hold"] or c["hold"]["median_min"] < MIN_MEDIAN_HOLD_MINUTES:
+                got = f"{c['hold']['median_min']:.0f}" if c["hold"] else "نامشخص"
+                print(f"   ✗ {addr[:10]}… نگه‌داری کوتاه: میانه {got} دقیقه")
+                continue
+
+        lev_map = fetch_leverage_map(addr, cfills)
+        c["max_lev"] = max(lev_map.values()) if lev_map else None
+        if (MAX_LEVERAGE_ALLOWED is not None and c["max_lev"] is not None
+                and c["max_lev"] > MAX_LEVERAGE_ALLOWED):
+            print(f"   ✗ {addr[:10]}… اهرم بالا: {c['max_lev']:.0f}x")
+            continue
+
         c["trade_stats"] = compute_trade_stats(
-            fills, c.get("av_ts"), c.get("av_vals"), lev_map
+            cfills, c.get("av_ts"), c.get("av_vals"), lev_map
         )
         time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+        s = c["trade_stats"]
+        if MAX_TRADES_PER_DAY is not None and s and s["per_day"] > MAX_TRADES_PER_DAY:
+            print(f"   ✗ {addr[:10]}… معامله‌ی زیاد: {s['per_day']:.1f} در روز")
+            continue
+
+        kept.append(c)
+
+    filtered = kept
+    print(f"پس از فیلترهای قابل‌کپی در البانک: {len(filtered)}")
 
     if MIN_WIN_RATE is not None:
         filtered = [
@@ -507,15 +670,29 @@ def size_filter_line():
     return f"   • مارجین هر ورود ≤ {MAX_POSITION_SIZE*100:.1f}% موجودی\n"
 
 
+def copy_filter_lines():
+    out = ""
+    if MIN_TRADABLE_SHARE is not None:
+        out += f"   • ≥ {MIN_TRADABLE_SHARE*100:.0f}% حجم معاملات روی کوین‌های البانک\n"
+    if MIN_MEDIAN_HOLD_MINUTES is not None:
+        out += f"   • میانه‌ی نگه‌داری ≥ {fmt_minutes(MIN_MEDIAN_HOLD_MINUTES)}\n"
+    if MAX_TRADES_PER_DAY is not None:
+        out += f"   • حداکثر {MAX_TRADES_PER_DAY} معامله در روز\n"
+    if MAX_LEVERAGE_ALLOWED is not None:
+        out += f"   • اهرم فعلی ≤ {MAX_LEVERAGE_ALLOWED}x\n"
+    return out
+
+
 def build_header(count):
     return (
-        f"🏆 {count} تریدر برتر Hyperliquid\n"
+        f"🏆 {count} تریدر Hyperliquid قابل‌کپی در البانک\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 معیار رتبه‌بندی: تعداد ماه‌های با ROI ≥ "
         f"{MONTHLY_ROI_THRESHOLD*100:.0f}% (از {MONTHS_TO_CHECK} ماه کامل اخیر)\n"
         f"✅ فیلترها:\n"
         f"{account_filter_line()}"
         f"{size_filter_line()}"
+        f"{copy_filter_lines()}"
         f"   • حجم معاملات هفته/ماه ≥ ${MIN_WEEK_VLM:,}\n"
         f"   • سابقه ≥ {MIN_AGE_DAYS} روز\n"
         f"   • حداقل {MIN_PASSING_TO_SHOW} ماه موفق برای نمایش\n"
@@ -534,6 +711,8 @@ def build_card(i, r):
         f"┃ 💰 موجودی: ${r['account_value']:,.0f}  |  🎂 {r['age_days']} روز\n"
         f"┃\n"
         f"┃ 🎯 ماه‌های موفق: {r['passing_months']}/{MONTHS_TO_CHECK}\n"
+        f"┃\n"
+        f"┃ {copy_info_str(r)}\n"
         f"┃\n"
         f"┃ 📈 {trade_stats_str(r)}\n"
         f"┃\n"
@@ -592,6 +771,9 @@ def send_telegram(message_or_chunks):
 #                          اجرای اصلی
 # ============================================================
 def main():
+    global LBANK_COINS
+    LBANK_COINS = load_lbank_coins()
+
     rows = fetch_rows()
     if not rows:
         send_telegram("⚠️ دریافت داده از Hyperliquid ناموفق بود.")
@@ -603,9 +785,10 @@ def main():
 
     if not final:
         send_telegram(
-            f"⚠️ هیچ تریدری با حداقل {MIN_PASSING_TO_SHOW} ماه موفق "
+            f"⚠️ هیچ تریدر قابل‌کپی در البانک با حداقل {MIN_PASSING_TO_SHOW} ماه موفق "
             f"(ROI ≥ {MONTHLY_ROI_THRESHOLD*100:.0f}%) یافت نشد.\n"
-            f"پیشنهاد: MIN_PASSING_TO_SHOW یا MONTHLY_ROI_THRESHOLD را کاهش دهید."
+            f"پیشنهاد: REQUIRE_ALL_MONTHS_POSITIVE را False کنید یا "
+            f"MIN_TRADABLE_SHARE / MIN_MEDIAN_HOLD_MINUTES / MAX_LEVERAGE_ALLOWED را آزادتر کنید."
         )
         return
 
