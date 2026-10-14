@@ -12,50 +12,31 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO_URL = "https://api.hyperliquid.xyz/info"
 
-# ------------------ تنظیمات اصلی ------------------
-LIMIT = 20                       # تعداد تریدر برتر نمایش داده‌شده
-MAX_ACCOUNT_VALUE = None          # حداکثر موجودی دلاری (None = بدون سقف)
-MIN_ACCOUNT_VALUE = 0         # حداقل موجودی دلاری
-MIN_WEEK_VLM = 1000              # حداقل حجم معاملات هفته/ماه اخیر
-MIN_AGE_DAYS = 365               # حداقل سابقه (یک سال)
-MIN_PASSING_TO_SHOW = 5          # حداقل ماه موفق برای نمایش
-
-MONTHLY_ROI_THRESHOLD = 0.05     # آستانه ROI هر ماه (۵٪)
-MONTHS_TO_CHECK = 12             # تعداد ماه‌های کامل اخیر
-MIN_MONTH_START_EQUITY = 20     # حداقل موجودی ابتدای ماه برای معتبر بودن ROI
-MAX_ALLOWED_MONTH_LOSS = -0.30   # اگر ماهی بدتر از این بود حذف شود (None = غیرفعال)
-MAX_GAP_DAYS = 15                # حداکثر فاصله‌ی مجاز نقطه‌ی history تا مرز ماه
-
-REQUIRE_ALL_MONTHS_POSITIVE = True   # فقط تریدرهایی که همه ماه‌ها ROI مثبت دارند
-MIN_CLOSED_TRADES = 30               # حداقل تعداد معامله‌ی بسته‌شده برای محاسبه‌ی وین‌ریت
-MAX_POSITION_SIZE = 0.10             # حداکثر مارجین هر ورود نسبت به موجودی (0.10 = ۱۰٪؛ None = غیرفعال)
-MAX_COINS_FOR_LEVERAGE = 8           # اهرم فقط برای این تعداد کوین پرمعامله‌ی هر تریدر گرفته می‌شود
-SIZE_METRIC = "max"                  # "max" = هر ورود، "p90" = ۹۰٪ ورودی‌ها، "median" = میانه
-MIN_WIN_RATE = None                  # مثلاً 0.5 یعنی فقط وین‌ریت ≥ ۵۰٪ (None = بدون فیلتر)
-MIN_VALID_MONTHS = 10                # حداقل تعداد ماه با داده‌ی معتبر (ماه‌های بدون داده نادیده گرفته می‌شوند)
-
-# ------------------ فیلترهای قابل‌کپی در البانک ------------------
-MIN_TRADABLE_SHARE = 0.50            # حداقل سهم حجم معاملات روی کوین‌های موجود در البانک (None = غیرفعال)
-MIN_MEDIAN_HOLD_MINUTES = None       # حداقل میانه‌ی مدت نگه‌داری پوزیشن، به دقیقه (None = غیرفعال)
-MAX_TRADES_PER_DAY = None            # حداکثر معامله‌ی بسته‌شده در روز روی کوین‌های قابل‌کپی (None = غیرفعال)
-MAX_LEVERAGE_ALLOWED = None          # حداکثر اهرم فعلی روی کوین‌های پرمعامله (None = غیرفعال)
-MIN_HOLD_SAMPLES = 5                 # حداقل تعداد پوزیشن کامل برای محاسبه‌ی مدت نگه‌داری
-
-# فهرست کوین‌های فیوچرز البانک: اول از ccxt، اگر نشد از این فایل (کوین‌ها با کاما یا خط جدید)
-LBANK_COINS_FILE = os.getenv("LBANK_COINS_FILE", "lbank_coins.txt")
-LBANK_COINS = set()                  # در main پر می‌شود
-
-# ------------------ تنظیمات عملکرد ------------------
+# ------------------ تنظیمات ------------------
+LIMIT = 100                      # تعداد تریدر نمایش داده‌شده
 TOP_BY_ALLTIME = 500             # تعداد کاندیدای اولیه برای بررسی عمیق
-SLEEP_BETWEEN_REQUESTS = 0.4     # مکث بین درخواست‌ها
+MONTHS_TO_CHECK = 12             # تعداد ماه‌های کامل اخیر برای بررسی
+MONTHLY_ROI_THRESHOLD = 0.05     # آستانه‌ی ROI مثبت/موفق هر ماه (۵٪)
+MIN_ACCOUNT_VALUE = 0
+MIN_WEEK_VLM = 1000              # حداقل حجم معاملات هفته/ماه
+MIN_MONTH_START_EQUITY = 20      # حداقل موجودی ابتدای ماه
+MIN_CLOSED_TRADES = 20           # حداقل معامله‌ی بسته برای وین‌ریت
+MAX_COINS_FOR_LEVERAGE = 5       # اهرم فقط برای N کوین پرمعامله گرفته می‌شود
+MAX_GAP_DAYS = 15                # حداکثر فاصله‌ی نقطه‌ی history تا مرز ماه
+
+SLEEP_BETWEEN_REQUESTS = 0.3
 MAX_RETRIES = 4
+
+# کوین‌های فیوچرز البانک
+LBANK_COINS_FILE = os.getenv("LBANK_COINS_FILE", "lbank_coins.txt")
+LBANK_COINS = set()
 
 SESSION = requests.Session()
 MS_DAY = 24 * 3600 * 1000
 
 
 # ============================================================
-#                        ابزار کمکی
+#                     ابزار کمکی
 # ============================================================
 def safe_float(v):
     try:
@@ -65,7 +46,6 @@ def safe_float(v):
 
 
 def redact(text):
-    """حذف توکن تلگرام از متن خطا"""
     text = str(text)
     if TELEGRAM_TOKEN:
         text = text.replace(TELEGRAM_TOKEN, "***")
@@ -73,7 +53,6 @@ def redact(text):
 
 
 def request_with_retry(method, url, **kwargs):
-    """درخواست با retry و backoff برای 429 و خطاهای شبکه"""
     last_exc = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -98,7 +77,6 @@ def get_perf(row, window, key):
 
 
 def roi_str(roi):
-    """roi همیشه به‌صورت کسر (مثلاً 0.12 = 12٪) است"""
     pct = roi * 100
     sign = "+" if pct >= 0 else ""
     return f"{sign}{pct:,.1f}%"
@@ -109,23 +87,10 @@ def pnl_str(pnl):
     return f"{sign}${pnl:,.0f}"
 
 
-def roi_list_str(rois):
-    return " · ".join(f"{x*100:+.1f}%" if x is not None else "—" for x in rois)
-
-
-def fmt_minutes(m):
-    if m < 60:
-        return f"{m:.0f} دقیقه"
-    if m < 1440:
-        return f"{m / 60:.1f} ساعت"
-    return f"{m / 1440:.1f} روز"
-
-
 # ============================================================
-#                  قابل‌کپی بودن کوین‌ها در البانک
+#              قابل‌کپی بودن کوین‌ها در البانک
 # ============================================================
 def load_lbank_coins():
-    """مجموعه‌ی کوین‌های فیوچرز USDT البانک. اگر ccxt جواب نداد از فایل می‌خواند."""
     coins = set()
     try:
         import ccxt
@@ -134,24 +99,22 @@ def load_lbank_coins():
         for m in ex.markets.values():
             if m.get("swap") and m.get("quote") == "USDT" and m.get("base"):
                 coins.add(str(m["base"]).upper())
-        print(f"ccxt: {len(coins)} کوین فیوچرز از البانک خوانده شد")
+        print(f"ccxt: {len(coins)} کوین فیوچرز از البانک")
     except Exception as e:
-        print(f"خواندن بازارهای البانک با ccxt ناموفق بود: {e}")
+        print(f"ccxt ناموفق: {e}")
 
     if not coins and os.path.exists(LBANK_COINS_FILE):
         with open(LBANK_COINS_FILE, encoding="utf-8") as fh:
             raw = fh.read().replace("\n", ",")
         coins = {x.strip().upper() for x in raw.split(",") if x.strip()}
-        print(f"فایل {LBANK_COINS_FILE}: {len(coins)} کوین")
+        print(f"فایل: {len(coins)} کوین")
 
     if not coins:
-        print("⚠️ فهرست کوین‌های البانک در دسترس نیست؛ فقط فیلتر ساختاری "
-              "(بدون ':' و '@' و '/') اعمال می‌شود. فایل lbank_coins.txt بسازید.")
+        print("⚠️ فهرست کوین‌های البانک در دسترس نیست.")
     return coins
 
 
 def is_plain_perp(coin):
-    """کوین معمولی هایپرلیکویید: نه بازار HIP-3 (با ':')، نه اسپات (@ یا /)"""
     c = str(coin or "")
     return bool(c) and ":" not in c and not c.startswith("@") and "/" not in c
 
@@ -163,13 +126,12 @@ def coin_ok(coin):
         return True
     c = str(coin)
     candidates = {c.upper()}
-    if len(c) > 1 and c[0] == "k" and c[1].isupper():   # kPEPE -> 1000PEPE
+    if len(c) > 1 and c[0] == "k" and c[1].isupper():
         candidates.add("1000" + c[1:].upper())
     return bool(candidates & LBANK_COINS)
 
 
 def tradable_share(fills):
-    """سهم حجم دلاری فیل‌هایی که روی کوین قابل‌کپی بوده‌اند"""
     total = ok = 0.0
     for f in fills:
         notional = safe_float(f.get("px")) * safe_float(f.get("sz"))
@@ -180,7 +142,7 @@ def tradable_share(fills):
 
 
 # ============================================================
-#                         دریافت داده
+#                    دریافت داده
 # ============================================================
 def fetch_rows():
     try:
@@ -215,104 +177,7 @@ def fetch_portfolio(address):
         return None
 
 
-# ============================================================
-#                    تحلیل portfolio
-# ============================================================
-def parse_history(history):
-    """تبدیل history به دو لیست مرتب‌شده (timestamps, values)"""
-    pairs = []
-    for point in history or []:
-        if isinstance(point, list) and len(point) == 2:
-            try:
-                pairs.append((int(point[0]), float(point[1])))
-            except (ValueError, TypeError):
-                continue
-    pairs.sort(key=lambda p: p[0])
-    return [p[0] for p in pairs], [p[1] for p in pairs]
-
-
-def extract_alltime(portfolio_data):
-    """خروجی: (av_ts, av_vals, pnl_ts, pnl_vals) یا None"""
-    alltime = None
-    if isinstance(portfolio_data, list):
-        for item in portfolio_data:
-            if (isinstance(item, list) and len(item) == 2
-                    and item[0] == "allTime" and isinstance(item[1], dict)):
-                alltime = item[1]
-                break
-    elif isinstance(portfolio_data, dict):
-        alltime = portfolio_data
-
-    if not alltime:
-        return None
-
-    av_ts, av_vals = parse_history(alltime.get("accountValueHistory"))
-    pnl_ts, pnl_vals = parse_history(alltime.get("pnlHistory"))
-    if not av_ts or not pnl_ts:
-        return None
-    return av_ts, av_vals, pnl_ts, pnl_vals
-
-
-def value_near(ts_list, vals, t_ms):
-    """مقدار نزدیک‌ترین نقطه به t_ms؛ اگر فاصله > MAX_GAP_DAYS باشد None"""
-    if not ts_list:
-        return None
-    idx = bisect_left(ts_list, t_ms)
-    best = None
-    for j in (idx - 1, idx):
-        if 0 <= j < len(ts_list):
-            diff = abs(ts_list[j] - t_ms)
-            if best is None or diff < best[0]:
-                best = (diff, vals[j])
-    if best is None or best[0] > MAX_GAP_DAYS * MS_DAY:
-        return None
-    return best[1]
-
-
-def account_age_days(series):
-    pnl_ts = series[2]
-    return int((time.time() * 1000 - pnl_ts[0]) / MS_DAY)
-
-
-def shift_month(dt, delta):
-    """جابه‌جایی ماه تقویمی؛ dt اول ماه است"""
-    m = dt.year * 12 + (dt.month - 1) + delta
-    return datetime(m // 12, m % 12 + 1, 1, tzinfo=timezone.utc)
-
-
-def compute_monthly_rois(series):
-    """
-    ROI ماه تقویمی = (تغییر pnl تجمعی در ماه) / (موجودی ابتدای ماه)
-    فقط ماه‌های کامل (ماه جاری حذف می‌شود). ترتیب خروجی: جدید → قدیم.
-    """
-    av_ts, av_vals, pnl_ts, pnl_vals = series
-    now = datetime.now(timezone.utc)
-    cur_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-
-    rois = []
-    for i in range(1, MONTHS_TO_CHECK + 1):
-        start = shift_month(cur_month, -i)
-        end = shift_month(cur_month, -i + 1)
-        s_ms = int(start.timestamp() * 1000)
-        e_ms = int(end.timestamp() * 1000)
-
-        av_start = value_near(av_ts, av_vals, s_ms)
-        pnl_start = value_near(pnl_ts, pnl_vals, s_ms)
-        pnl_end = value_near(pnl_ts, pnl_vals, e_ms)
-
-        if (av_start is None or pnl_start is None or pnl_end is None
-                or av_start < MIN_MONTH_START_EQUITY):
-            rois.append(None)
-            continue
-
-        rois.append((pnl_end - pnl_start) / av_start)
-
-    passing = sum(1 for r in rois if r is not None and r >= MONTHLY_ROI_THRESHOLD)
-    return rois, passing
-
-
 def fetch_fills(address):
-    """آخرین معاملات (حداکثر ۲۰۰۰ fill اخیر)"""
     try:
         res = request_with_retry(
             "POST", INFO_URL,
@@ -327,10 +192,6 @@ def fetch_fills(address):
 
 
 def fetch_leverage_map(address, fills):
-    """
-    اهرم فعلی تریدر برای پرمعامله‌ترین کوین‌هایش (activeAssetData).
-    تاریخچه‌ی اهرم در API نیست؛ این مقدار تخمین است.
-    """
     counts = {}
     for f in fills:
         if str(f.get("dir", "")).startswith("Open"):
@@ -355,52 +216,92 @@ def fetch_leverage_map(address, fills):
     return result
 
 
-def compute_hold_stats(fills):
-    """
-    مدت نگه‌داری پوزیشن‌های کامل (از صفر تا صفر یا برگشت جهت) با startPosition هر fill.
-    پوزیشن‌هایی که قبل از شروع پنجره‌ی fillها باز بوده‌اند نادیده گرفته می‌شوند.
-    """
-    by_coin = defaultdict(list)
-    for f in fills:
-        by_coin[f.get("coin")].append(f)
+# ============================================================
+#                تحلیل portfolio
+# ============================================================
+def parse_history(history):
+    pairs = []
+    for point in history or []:
+        if isinstance(point, list) and len(point) == 2:
+            try:
+                pairs.append((int(point[0]), float(point[1])))
+            except (ValueError, TypeError):
+                continue
+    pairs.sort(key=lambda p: p[0])
+    return [p[0] for p in pairs], [p[1] for p in pairs]
 
-    holds = []
-    for _coin, fs in by_coin.items():
-        fs.sort(key=lambda x: x.get("time") or 0)
-        open_t = None
-        for f in fs:
-            start = safe_float(f.get("startPosition"))
-            sz = safe_float(f.get("sz"))
-            end = start + sz if f.get("side") == "B" else start - sz
-            t = f.get("time") or 0
-            tiny = max(abs(start), sz) * 1e-6
 
-            start_flat = abs(start) <= tiny
-            end_flat = abs(end) <= tiny
-            flipped = (not start_flat) and (not end_flat) and (start * end < 0)
+def extract_alltime(portfolio_data):
+    alltime = None
+    if isinstance(portfolio_data, list):
+        for item in portfolio_data:
+            if (isinstance(item, list) and len(item) == 2
+                    and item[0] == "allTime" and isinstance(item[1], dict)):
+                alltime = item[1]
+                break
+    elif isinstance(portfolio_data, dict):
+        alltime = portfolio_data
 
-            if open_t is not None and (end_flat or flipped):
-                holds.append(t - open_t)
-                open_t = None
-            if (not end_flat) and (start_flat or flipped):
-                open_t = t
-
-    if len(holds) < MIN_HOLD_SAMPLES:
+    if not alltime:
         return None
-    holds.sort()
-    minutes = [h / 60000 for h in holds]
-    return {
-        "n": len(minutes),
-        "median_min": minutes[len(minutes) // 2],
-        "avg_min": sum(minutes) / len(minutes),
-    }
+    av_ts, av_vals = parse_history(alltime.get("accountValueHistory"))
+    pnl_ts, pnl_vals = parse_history(alltime.get("pnlHistory"))
+    if not av_ts or not pnl_ts:
+        return None
+    return av_ts, av_vals, pnl_ts, pnl_vals
 
 
+def value_near(ts_list, vals, t_ms):
+    if not ts_list:
+        return None
+    idx = bisect_left(ts_list, t_ms)
+    best = None
+    for j in (idx - 1, idx):
+        if 0 <= j < len(ts_list):
+            diff = abs(ts_list[j] - t_ms)
+            if best is None or diff < best[0]:
+                best = (diff, vals[j])
+    if best is None or best[0] > MAX_GAP_DAYS * MS_DAY:
+        return None
+    return best[1]
+
+
+def shift_month(dt, delta):
+    m = dt.year * 12 + (dt.month - 1) + delta
+    return datetime(m // 12, m % 12 + 1, 1, tzinfo=timezone.utc)
+
+
+def compute_monthly_rois(series):
+    av_ts, av_vals, pnl_ts, pnl_vals = series
+    now = datetime.now(timezone.utc)
+    cur_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+    rois = []
+    for i in range(1, MONTHS_TO_CHECK + 1):
+        start = shift_month(cur_month, -i)
+        end = shift_month(cur_month, -i + 1)
+        s_ms = int(start.timestamp() * 1000)
+        e_ms = int(end.timestamp() * 1000)
+
+        av_start = value_near(av_ts, av_vals, s_ms)
+        pnl_start = value_near(pnl_ts, pnl_vals, s_ms)
+        pnl_end = value_near(pnl_ts, pnl_vals, e_ms)
+
+        if (av_start is None or pnl_start is None or pnl_end is None
+                or av_start < MIN_MONTH_START_EQUITY):
+            rois.append(None)
+            continue
+
+        rois.append((pnl_end - pnl_start) / av_start)
+
+    positive = sum(1 for r in rois if r is not None and r > 0)
+    return rois, positive
+
+
+# ============================================================
+#                تحلیل معاملات
+# ============================================================
 def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
-    """
-    وین‌ریت بر اساس معاملات بسته‌شده. fillهای یک سفارش (oid) یک معامله حساب
-    می‌شوند. سود خالص = closedPnl - کارمزد fillهای بستن.
-    """
     groups = {}
     for f in fills:
         closed = safe_float(f.get("closedPnl"))
@@ -416,14 +317,13 @@ def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
         return None
 
     wins = [x for x in nets if x > 0]
-    losses = [x for x in nets if x <= 0]
-    avg_win = sum(wins) / len(wins) if wins else 0.0
-    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
+    win_rate = len(wins) / n
 
     times = [f["time"] for f in fills if f.get("time")]
     days = (max(times) - min(times)) / MS_DAY if times else 0
+    per_day = n / max(days, 1)
 
-    # حجم هر ورود (notional) نسبت به موجودی حساب در همان زمان
+    # حجم هر ورود (notional) نسبت به موجودی
     opens = {}
     for f in fills:
         if not str(f.get("dir", "")).startswith("Open"):
@@ -444,291 +344,182 @@ def compute_trade_stats(fills, av_ts=None, av_vals=None, lev_map=None):
             continue
         equity = value_near(av_ts, av_vals, t) if av_ts else None
         if equity and equity > 0 and notional > 0:
-            sizes.append((notional / lev) / equity)   # مارجین / موجودی
+            sizes.append((notional / lev) / equity)
     sizes.sort()
 
     size_median = size_p90 = size_max = None
-    if len(sizes) >= 10:
+    if len(sizes) >= 5:
         size_median = sizes[len(sizes) // 2]
         size_max = sizes[-1]
         size_p90 = sizes[min(len(sizes) - 1, int(len(sizes) * 0.9))]
 
     return {
         "n": n,
-        "win_rate": len(wins) / n,
-        "rr": (avg_win / avg_loss) if avg_loss > 0 else None,
+        "win_rate": win_rate,
         "days": days,
-        "per_day": n / max(days, 1),
+        "per_day": per_day,
         "size_median": size_median,
         "size_p90": size_p90,
         "size_max": size_max,
     }
 
 
-def trade_stats_str(r):
-    s = r.get("trade_stats")
-    if not s:
-        return "وین‌ریت: داده‌ی کافی نیست"
-    text = f"وین‌ریت: {s['win_rate']*100:.0f}% ({s['n']} معامله، {s['days']:.0f} روز اخیر)"
-    if s["rr"] is not None:
-        text += f" | میانگین سود/ضرر: {s['rr']:.2f}"
-    lines = [text, f"🔁 میانگین معامله در روز: {s['per_day']:.1f}"]
-    if s["size_median"] is not None:
-        lines.append(
-            f"💼 مارجین هر ورود (تخمینی) نسبت به موجودی: میانه {s['size_median']*100:.1f}% "
-            f"| ۹۰٪ ورودی‌ها زیر {s['size_p90']*100:.1f}% "
-            f"| حداکثر {s['size_max']*100:.1f}%"
-        )
-    return "\n┃ ".join(lines)
-
-
-def copy_info_str(r):
-    """خلاصه‌ی قابل‌کپی بودن برای البانک"""
-    return f"✅ سهم حجم روی کوین‌های موجود در البانک: {r['tradable_share']*100:.0f}%"
-
-
 # ============================================================
-#                       انتخاب برترین‌ها
+#                انتخاب تریدرهای برتر
 # ============================================================
-def build_candidates(rows):
+def select_top_traders(rows):
     candidates = []
     for row in rows:
         addr = row.get("ethAddress") or row.get("address")
         if not addr:
             continue
+        av = safe_float(row.get("accountValue", 0))
+        if av < MIN_ACCOUNT_VALUE:
+            continue
+        wk = get_perf(row, "week", "vlm")
+        mo = get_perf(row, "month", "vlm")
+        if wk < MIN_WEEK_VLM and mo < MIN_WEEK_VLM:
+            continue
+        all_roi = get_perf(row, "allTime", "roi")
+        if all_roi <= 0:
+            continue
+
         candidates.append({
             "address": addr,
             "display_name": row.get("displayName") or "",
-            "account_value": safe_float(row.get("accountValue", 0)),
+            "account_value": av,
             "day_roi": get_perf(row, "day", "roi"),
             "week_roi": get_perf(row, "week", "roi"),
             "month_roi": get_perf(row, "month", "roi"),
-            "all_roi": get_perf(row, "allTime", "roi"),
+            "all_roi": all_roi,
             "day_pnl": get_perf(row, "day", "pnl"),
             "week_pnl": get_perf(row, "week", "pnl"),
             "month_pnl": get_perf(row, "month", "pnl"),
             "all_pnl": get_perf(row, "allTime", "pnl"),
-            "week_vlm": get_perf(row, "week", "vlm"),
-            "month_vlm": get_perf(row, "month", "vlm"),
         })
-    return [c for c in candidates if c["all_roi"] > 0]
 
-
-def passes_light_filters(c):
-    if c["account_value"] < MIN_ACCOUNT_VALUE:
-        return False
-    if MAX_ACCOUNT_VALUE is not None and c["account_value"] > MAX_ACCOUNT_VALUE:
-        return False
-    if c["week_vlm"] < MIN_WEEK_VLM and c["month_vlm"] < MIN_WEEK_VLM:
-        return False
-    return True
-
-
-def select_top_traders(rows):
-    candidates = build_candidates(rows)
-    print(f"تعداد کل کاندیداها (ROI مثبت): {len(candidates)}")
-
-    # اول فیلتر سبک، بعد برش top N
-    pre_filtered = [c for c in candidates if passes_light_filters(c)]
-    pre_filtered.sort(key=lambda x: x["all_roi"], reverse=True)
-    pre_filtered = pre_filtered[:TOP_BY_ALLTIME]
-    print(f"پس از فیلترهای سبک: {len(pre_filtered)}")
+    candidates.sort(key=lambda x: x["all_roi"], reverse=True)
+    candidates = candidates[:TOP_BY_ALLTIME]
+    print(f"کاندیداهای اولیه: {len(candidates)}")
 
     analyzed = []
-    for i, c in enumerate(pre_filtered, 1):
+    for i, c in enumerate(candidates, 1):
         addr = c["address"]
-        print(f"[{i}/{len(pre_filtered)}] بررسی: {addr}")
+        print(f"[{i}/{len(candidates)}] {addr}")
 
         try:
             portfolio = fetch_portfolio(addr)
             time.sleep(SLEEP_BETWEEN_REQUESTS)
-
             series = extract_alltime(portfolio) if portfolio else None
             if not series:
-                print("   ✗ portfolio خالی")
                 continue
-
-            age_days = account_age_days(series)
-            if age_days < MIN_AGE_DAYS:
-                print(f"   ✗ سن حساب کم: {age_days} روز")
-                continue
-
-            monthly_rois, passing = compute_monthly_rois(series)
-
-            if MAX_ALLOWED_MONTH_LOSS is not None and any(
-                r is not None and r < MAX_ALLOWED_MONTH_LOSS for r in monthly_rois
-            ):
-                print("   ✗ ماه با ضرر شدید")
-                continue
-
-            if REQUIRE_ALL_MONTHS_POSITIVE:
-                valid = [r for r in monthly_rois if r is not None]
-                if len(valid) < MIN_VALID_MONTHS:
-                    print(f"   ✗ ماه‌های معتبر کم: {len(valid)}")
-                    continue
-                if any(r <= 0 for r in valid):
-                    print("   ✗ حداقل یک ماه منفی/صفر")
-                    continue
-
-            print(f"   ✓ سن: {age_days} روز | موفق: {passing}/{MONTHS_TO_CHECK}")
-            print(f"      {roi_list_str(monthly_rois)}")
 
             c["av_ts"], c["av_vals"] = series[0], series[1]
-            c["age_days"] = age_days
+            c["age_days"] = int((time.time() * 1000 - series[2][0]) / MS_DAY)
+
+            monthly_rois, positive = compute_monthly_rois(series)
             c["monthly_rois"] = monthly_rois
-            c["passing_months"] = passing
+            c["positive_months"] = positive
+            valid = [r for r in monthly_rois if r is not None]
+            c["avg_monthly_roi"] = (sum(valid) / len(valid)) if valid else None
+
+            fills = fetch_fills(addr)
+            time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+            if not fills:
+                c["tradable_share"] = 0.0
+                c["trade_stats"] = None
+                c["max_lev"] = None
+                analyzed.append(c)
+                continue
+
+            c["tradable_share"] = tradable_share(fills)
+            cfills = [f for f in fills if coin_ok(f.get("coin"))]
+
+            lev_map = fetch_leverage_map(addr, cfills) if cfills else {}
+            c["max_lev"] = max(lev_map.values()) if lev_map else None
+
+            c["trade_stats"] = compute_trade_stats(
+                cfills, c.get("av_ts"), c.get("av_vals"), lev_map
+            )
             analyzed.append(c)
 
         except Exception as e:
-            print(f"   ✗ خطا برای {addr}: {e}")
+            print(f"   ✗ خطا: {e}")
 
-    analyzed.sort(key=lambda x: (x["passing_months"], x["all_roi"]), reverse=True)
-    filtered = [c for c in analyzed if c["passing_months"] >= MIN_PASSING_TO_SHOW]
-    print(f"تعداد تریدرهای با ≥ {MIN_PASSING_TO_SHOW} ماه موفق: {len(filtered)}")
-
-    # ---------- بررسی fillها و فیلترهای قابل‌کپی در البانک ----------
-    kept = []
-    for c in filtered:
-        addr = c["address"]
-        fills = fetch_fills(addr)
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-        if not fills:
-            print(f"   ✗ {addr} fill ندارد")
-            continue
-
-        share = tradable_share(fills)
-        c["tradable_share"] = share
-        if MIN_TRADABLE_SHARE is not None and share < MIN_TRADABLE_SHARE:
-            print(f"   ✗ {addr} سهم کوین قابل‌کپی کم: {share*100:.0f}%")
-            continue
-
-        # از اینجا به بعد فقط fillهای کوین‌های قابل‌کپی حساب می‌شوند
-        cfills = [f for f in fills if coin_ok(f.get("coin"))]
-
-        c["hold"] = compute_hold_stats(cfills)
-        if MIN_MEDIAN_HOLD_MINUTES is not None:
-            if not c["hold"] or c["hold"]["median_min"] < MIN_MEDIAN_HOLD_MINUTES:
-                got = f"{c['hold']['median_min']:.0f}" if c["hold"] else "نامشخص"
-                print(f"   ✗ {addr} نگه‌داری کوتاه: میانه {got} دقیقه")
-                continue
-
-        lev_map = fetch_leverage_map(addr, cfills)
-        c["max_lev"] = max(lev_map.values()) if lev_map else None
-        if (MAX_LEVERAGE_ALLOWED is not None and c["max_lev"] is not None
-                and c["max_lev"] > MAX_LEVERAGE_ALLOWED):
-            print(f"   ✗ {addr} اهرم بالا: {c['max_lev']:.0f}x")
-            continue
-
-        c["trade_stats"] = compute_trade_stats(
-            cfills, c.get("av_ts"), c.get("av_vals"), lev_map
-        )
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-        s = c["trade_stats"]
-        if MAX_TRADES_PER_DAY is not None and s and s["per_day"] > MAX_TRADES_PER_DAY:
-            print(f"   ✗ {addr} معامله‌ی زیاد: {s['per_day']:.1f} در روز")
-            continue
-
-        kept.append(c)
-
-    filtered = kept
-    print(f"پس از فیلترهای قابل‌کپی در البانک: {len(filtered)}")
-
-    if MIN_WIN_RATE is not None:
-        filtered = [
-            c for c in filtered
-            if c["trade_stats"] and c["trade_stats"]["win_rate"] >= MIN_WIN_RATE
-        ]
-        print(f"پس از فیلتر وین‌ریت ≥ {MIN_WIN_RATE*100:.0f}%: {len(filtered)}")
-
-    if MAX_POSITION_SIZE is not None:
-        size_key = {"max": "size_max", "p90": "size_p90", "median": "size_median"}[SIZE_METRIC]
-        filtered = [
-            c for c in filtered
-            if c["trade_stats"]
-            and c["trade_stats"].get(size_key) is not None
-            and c["trade_stats"][size_key] <= MAX_POSITION_SIZE
-        ]
-        print(f"پس از فیلتر حجم ورود ≤ {MAX_POSITION_SIZE*100:.1f}%: {len(filtered)}")
-
-    return filtered[:LIMIT]
+    # مرتب‌سازی: اول تعداد ماه مثبت، بعد ROI کل
+    analyzed.sort(
+        key=lambda x: (x.get("positive_months", 0), x["all_roi"]),
+        reverse=True,
+    )
+    print(f"تعداد تحلیل‌شده: {len(analyzed)}")
+    return analyzed[:LIMIT]
 
 
 # ============================================================
-#                        ساخت پیام
+#                ساخت پیام
 # ============================================================
-def account_filter_line():
-    if MIN_ACCOUNT_VALUE <= 0 and MAX_ACCOUNT_VALUE is None:
-        return ""
-    hi = f"${MAX_ACCOUNT_VALUE:,}" if MAX_ACCOUNT_VALUE is not None else "بدون سقف"
-    return f"   • موجودی ${MIN_ACCOUNT_VALUE:,} تا {hi}\n"
-
-
-def size_filter_line():
-    if MAX_POSITION_SIZE is None:
-        return ""
-    return f"   • مارجین هر ورود ≤ {MAX_POSITION_SIZE*100:.1f}% موجودی\n"
-
-
-def copy_filter_lines():
-    out = ""
-    if MIN_TRADABLE_SHARE is not None:
-        out += f"   • ≥ {MIN_TRADABLE_SHARE*100:.0f}% حجم معاملات روی کوین‌های البانک\n"
-    if MIN_MEDIAN_HOLD_MINUTES is not None:
-        out += f"   • میانه‌ی نگه‌داری ≥ {fmt_minutes(MIN_MEDIAN_HOLD_MINUTES)}\n"
-    if MAX_TRADES_PER_DAY is not None:
-        out += f"   • حداکثر {MAX_TRADES_PER_DAY} معامله در روز\n"
-    if MAX_LEVERAGE_ALLOWED is not None:
-        out += f"   • اهرم فعلی ≤ {MAX_LEVERAGE_ALLOWED}x\n"
-    return out
-
-
 def build_header(count):
     return (
-        f"🏆 {count} تریدر Hyperliquid قابل‌کپی در البانک\n"
+        f"🏆 {count} تریدر برتر Hyperliquid\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 معیار رتبه‌بندی: تعداد ماه‌های با ROI ≥ "
-        f"{MONTHLY_ROI_THRESHOLD*100:.0f}% (از {MONTHS_TO_CHECK} ماه کامل اخیر)\n"
-        f"✅ فیلترها:\n"
-        f"{account_filter_line()}"
-        f"{size_filter_line()}"
-        f"{copy_filter_lines()}"
-        f"   • حجم معاملات هفته/ماه ≥ ${MIN_WEEK_VLM:,}\n"
-        f"   • سابقه ≥ {MIN_AGE_DAYS} روز\n"
-        f"   • حداقل {MIN_PASSING_TO_SHOW} ماه موفق برای نمایش\n"
-        + ("   • همه ماه‌ها ROI مثبت\n" if REQUIRE_ALL_MONTHS_POSITIVE else "")
-        + f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 معیارها: ماه‌های مثبت (از {MONTHS_TO_CHECK} ماه اخیر)، "
+        f"وین‌ریت، معاملات روزانه، مارجین هر ورود، "
+        f"سود ماهانه و سهم کوین‌های البانک\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
 
 def build_card(i, r):
     name_part = f" ({r['display_name']})" if r["display_name"] else ""
     medal = {1: "🥇 ", 2: "🥈 ", 3: "🥉 "}.get(i, "")
+
+    ts = r.get("trade_stats")
+    if ts:
+        win_line = f"📈 وین‌ریت: {ts['win_rate']*100:.0f}% ({ts['n']} معامله)"
+        perday_line = f"🔁 میانگین معامله در روز: {ts['per_day']:.1f}"
+        if ts.get("size_median") is not None:
+            margin_line = (
+                f"💼 مارجین هر ورود: میانه {ts['size_median']*100:.1f}% "
+                f"| ۹۰٪ زیر {ts['size_p90']*100:.1f}% "
+                f"| حداکثر {ts['size_max']*100:.1f}%"
+            )
+        else:
+            margin_line = "💼 مارجین هر ورود: داده‌ی کافی نیست"
+    else:
+        win_line = "📈 وین‌ریت: داده‌ی کافی نیست"
+        perday_line = "🔁 میانگین معامله در روز: —"
+        margin_line = "💼 مارجین هر ورود: —"
+
+    avg_monthly = r.get("avg_monthly_roi")
+    avg_line = f"{avg_monthly*100:+.1f}%" if avg_monthly is not None else "—"
+
+    rois = r.get("monthly_rois") or []
+    rois_line = " · ".join(
+        f"{x*100:+.1f}%" if x is not None else "—" for x in rois
+    )
+
     return (
         f"┏━━━━━━━━━━━━━━━━━━━━━\n"
         f"┃ {medal}#{i}{name_part}\n"
         f"┃ 🔗 {r['address']}\n"
         f"┃ 💰 موجودی: ${r['account_value']:,.0f}  |  🎂 {r['age_days']} روز\n"
         f"┃\n"
-        f"┃ 🎯 ماه‌های موفق: {r['passing_months']}/{MONTHS_TO_CHECK}\n"
+        f"┃ ✅ ماه‌های مثبت: {r['positive_months']}/{MONTHS_TO_CHECK}\n"
+        f"┃ {win_line}\n"
+        f"┃ {perday_line}\n"
+        f"┃ {margin_line}\n"
+        f"┃ 🏦 سهم کوین‌های البانک: {r['tradable_share']*100:.0f}%\n"
         f"┃\n"
-        f"┃ {copy_info_str(r)}\n"
-        f"┃\n"
-        f"┃ 📈 {trade_stats_str(r)}\n"
-        f"┃\n"
-        f"┃ 📅 روزانه : {roi_str(r['day_roi'])} · {pnl_str(r['day_pnl'])}\n"
-        f"┃ 📆 هفتگی : {roi_str(r['week_roi'])} · {pnl_str(r['week_pnl'])}\n"
-        f"┃ 🗓️ ماهانه : {roi_str(r['month_roi'])} · {pnl_str(r['month_pnl'])}\n"
-        f"┃ 🏆 کل دوره: {roi_str(r['all_roi'])} · {pnl_str(r['all_pnl'])}\n"
-        f"┃\n"
-        f"┃ 📊 ROI ماهانه (جدید→قدیم):\n"
-        f"┃    {roi_list_str(r['monthly_rois'])}\n"
+        f"┃ 📅 سود هر ماه (جدید → قدیم):\n"
+        f"┃    {rois_line}\n"
+        f"┃ 📊 میانگین سود ماهانه: {avg_line}\n"
+        f"┃ 🏆 ROI کل: {roi_str(r['all_roi'])} | PnL: {pnl_str(r['all_pnl'])}\n"
         f"┗━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
 
 def build_chunks(records, limit=4000):
-    """پیام‌ها را کارت‌به‌کارت تقسیم می‌کند تا وسط کارت قطع نشود"""
     chunks = []
     current = build_header(len(records))
     for i, r in enumerate(records, 1):
@@ -743,7 +534,7 @@ def build_chunks(records, limit=4000):
 
 
 # ============================================================
-#                       ارسال به تلگرام
+#                ارسال به تلگرام
 # ============================================================
 def send_telegram(message_or_chunks):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -768,7 +559,7 @@ def send_telegram(message_or_chunks):
 
 
 # ============================================================
-#                          اجرای اصلی
+#                اجرای اصلی
 # ============================================================
 def main():
     global LBANK_COINS
@@ -781,15 +572,10 @@ def main():
 
     print(f"کل تریدرهای دریافتی: {len(rows)}")
     final = select_top_traders(rows)
-    print(f"تعداد تریدرهای نهایی: {len(final)}")
+    print(f"تعداد نهایی: {len(final)}")
 
     if not final:
-        send_telegram(
-            f"⚠️ هیچ تریدر قابل‌کپی در البانک با حداقل {MIN_PASSING_TO_SHOW} ماه موفق "
-            f"(ROI ≥ {MONTHLY_ROI_THRESHOLD*100:.0f}%) یافت نشد.\n"
-            f"پیشنهاد: REQUIRE_ALL_MONTHS_POSITIVE را False کنید یا "
-            f"MIN_TRADABLE_SHARE / MIN_MEDIAN_HOLD_MINUTES / MAX_LEVERAGE_ALLOWED را آزادتر کنید."
-        )
+        send_telegram("⚠️ هیچ تریدری برای نمایش یافت نشد.")
         return
 
     send_telegram(build_chunks(final))
