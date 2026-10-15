@@ -14,11 +14,11 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 # ------------------ تنظیمات ------------------
 LIMIT = 20                       # تعداد تریدر نمایش داده‌شده
 TOP_CANDIDATES = 500             # تعداد تریدر برتر بر اساس نسبت ماه‌های مثبت
-MONTHS_TO_CHECK = 12             # تعداد ماه‌های کامل اخیر برای شمارش
+MONTHS_TO_CHECK = 8              # ✅ تعداد ماه‌های کامل اخیر برای شمارش
 PROFIT_MONTHS = 6                # بازه‌ی محاسبه‌ی سود (ماه)
 
-MIN_AGE_DAYS = 365               # ✅ حداقل سابقه ۱۲ ماه
-MIN_VALID_MONTHS = 5             # حداقل ۵ ماه داده‌ی معتبر (برای نسبت معنادار)
+MIN_AGE_DAYS = 180               # ✅ حداقل سابقه (۶ ماه)
+MIN_VALID_MONTHS = 6             # ✅ حداقل ۶ ماه داده‌ی معتبر (از ۸)
 
 MIN_ACCOUNT_VALUE = 0
 MIN_WEEK_VLM = 1000
@@ -29,10 +29,12 @@ MAX_GAP_DAYS = 15
 MAX_RR_CAP = 10.0
 
 MIN_TRADABLE_SHARE = 0.80        # حداقل ۸۰٪ حجم معاملات روی کوین‌های البانک
+MIN_AVG_MONTHLY_ROI = 0.0        # ✅ فقط تریدرهایی با میانگین سود ماهانه مثبت
 
+# ✅ امتیازدهی: نصف میانگین سود ماهانه + نصف تعداد ماه‌های مثبت
 WEIGHTS = {
-    "win_rate": 0.50,
-    "rr_ratio": 0.50,
+    "avg_monthly_roi": 0.5,      # وزن میانگین سود ماهانه
+    "positive_months": 0.5,      # وزن تعداد ماه‌های مثبت
 }
 
 SLEEP_BETWEEN_REQUESTS = 0.3
@@ -366,9 +368,10 @@ def rank_scores(values, higher_better=True):
 
 
 def score_traders(records):
+    # ✅ امتیازدهی: نصف میانگین سود ماهانه + نصف تعداد ماه‌های مثبت
     metrics = {
-        "win_rate": ([r["trade_stats"]["win_rate"] for r in records], True),
-        "rr_ratio": ([r["trade_stats"]["rr_ratio"] for r in records], True),
+        "avg_monthly_roi": ([r["avg_monthly_roi"] for r in records], True),
+        "positive_months": ([r["positive_months"] for r in records], True),
     }
     total_w = sum(WEIGHTS.values())
     for r in records:
@@ -378,6 +381,7 @@ def score_traders(records):
         w = WEIGHTS.get(name, 0)
         for r, s in zip(records, sc):
             r["score"] += w * s
+            r.setdefault("_parts", {})[name] = s * w / total_w * 100
     for r in records:
         r["score"] = r["score"] / total_w * 100
     records.sort(key=lambda r: r["score"], reverse=True)
@@ -401,15 +405,12 @@ def select_top_traders(rows):
         mo = get_perf(row, "month", "vlm")
         if wk < MIN_WEEK_VLM and mo < MIN_WEEK_VLM:
             continue
-        all_roi = get_perf(row, "allTime", "roi")
-        if all_roi <= 0:
-            continue
 
         candidates.append({
             "address": addr,
             "display_name": row.get("displayName") or "",
             "account_value": av,
-            "all_roi": all_roi,
+            "all_roi": get_perf(row, "allTime", "roi"),
             "all_pnl": get_perf(row, "allTime", "pnl"),
         })
 
@@ -432,7 +433,6 @@ def select_top_traders(rows):
             if not series:
                 continue
 
-            # فیلتر سابقه (≥ ۱۲ ماه)
             c["age_days"] = int((time.time() * 1000 - series[2][0]) / MS_DAY)
             if c["age_days"] < MIN_AGE_DAYS:
                 skipped_age += 1
@@ -448,6 +448,13 @@ def select_top_traders(rows):
             c["positive_months"] = positive
             c["valid_months"] = valid
             c["positive_ratio"] = positive / valid if valid > 0 else 0.0
+
+            # ✅ میانگین سود ماهانه روی همه‌ی ماه‌های معتبر
+            valid_rois = [r for r in monthly_rois if r is not None]
+            c["avg_monthly_roi"] = (
+                sum(valid_rois) / len(valid_rois) if valid_rois else 0.0
+            )
+
             c["_series"] = series
             enriched.append(c)
         except Exception as e:
@@ -456,17 +463,19 @@ def select_top_traders(rows):
     print(f"واجد شرایط اولیه: {len(enriched)}  "
           f"(رد سابقه: {skipped_age} | رد ماه معتبر: {skipped_valid})")
 
-    # ---------- مرحله ۳: مرتب‌سازی نسبی (عادلانه بین ۶ ماهه و ۲ ساله) ----------
+    # ---------- مرحله ۳: مرتب‌سازی نسبی ----------
+    # ✅ تعداد ماه‌های مثبت + میانگین سود ماهانه، هر دو در انتخاب ۵۰۰ نفر برتر نقش دارند
     enriched.sort(
-        key=lambda x: (x["positive_ratio"], x["positive_months"], x["all_roi"]),
+        key=lambda x: (x["positive_months"], x["avg_monthly_roi"], x["all_roi"]),
         reverse=True,
     )
     top_by_months = enriched[:TOP_CANDIDATES]
-    print(f"انتخاب {len(top_by_months)} تریدر برتر بر اساس نسبت ماه مثبت")
+    print(f"انتخاب {len(top_by_months)} تریدر برتر بر اساس ماه مثبت + سود ماهانه")
 
     # ---------- مرحله ۴: تحلیل عمیق ----------
     analyzed = []
     skipped_lbank = 0
+    skipped_neg = 0
     for i, c in enumerate(top_by_months, 1):
         addr = c["address"]
         print(f"[{i}/{len(top_by_months)}] {addr}  "
@@ -479,6 +488,11 @@ def select_top_traders(rows):
                 continue
             c["roi_6m"], c["pnl_6m"] = roi_6m, pnl_6m
 
+            # ✅ فیلتر میانگین سود ماهانه مثبت
+            if c["avg_monthly_roi"] <= MIN_AVG_MONTHLY_ROI:
+                skipped_neg += 1
+                continue
+
             fills = fetch_fills(addr)
             time.sleep(SLEEP_BETWEEN_REQUESTS)
             if not fills:
@@ -486,7 +500,6 @@ def select_top_traders(rows):
 
             c["tradable_share"] = tradable_share(fills)
 
-            # فیلتر سخت: حداقل ۸۰٪ کوین‌های البانک
             if c["tradable_share"] < MIN_TRADABLE_SHARE:
                 skipped_lbank += 1
                 continue
@@ -507,7 +520,7 @@ def select_top_traders(rows):
             print(f"   ✗ خطا: {e}")
 
     print(f"واجد شرایط نهایی: {len(analyzed)} "
-          f"(رد البانک: {skipped_lbank})")
+          f"(رد البانک: {skipped_lbank} | رد سود منفی: {skipped_neg})")
     if not analyzed:
         return []
     return score_traders(analyzed)[:LIMIT]
@@ -520,8 +533,8 @@ def build_header(count):
     return (
         f"🏆 {count} کیف پول برتر Hyperliquid\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 انتخاب: بالاترین نسبت ماه مثبت (از {MONTHS_TO_CHECK} ماه اخیر)\n"
-        f"🎯 امتیاز: وین‌ریت ۵۰٪ + ریسک به ریوارد ۵۰٪\n"
+        f"📊 انتخاب: بالاترین ماه مثبت + سود ماهانه (از {MONTHS_TO_CHECK} ماه اخیر)\n"
+        f"🎯 امتیاز: ۵۰٪ میانگین سود ماهانه + ۵۰٪ تعداد ماه‌های مثبت\n"
         f"🛡️ فیلتر: ≥ {MIN_TRADABLE_SHARE*100:.0f}٪ البانک | "
         f"≥ {MIN_VALID_MONTHS} ماه معتبر | ≥ {MIN_AGE_DAYS//30} ماه سابقه\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -539,16 +552,29 @@ def build_card(i, r):
         for x in (r.get("monthly_rois") or [])
     )
 
-    rr_display = f"{ts['rr_ratio']:.2f}" if ts['rr_ratio'] < MAX_RR_CAP else f"> {MAX_RR_CAP:.0f}"
+    rr_display = (
+        f"{ts['rr_ratio']:.2f}"
+        if ts['rr_ratio'] < MAX_RR_CAP
+        else f"> {MAX_RR_CAP:.0f}"
+    )
+
+    # ✅ امتیاز تفکیکی (نصف سود + نصف ماه مثبت)
+    parts = r.get("_parts", {})
+    parts_line = (
+        f"┃    📈 سود: {parts.get('avg_monthly_roi', 0):.0f} | "
+        f"📅 پایداری: {parts.get('positive_months', 0):.0f}\n"
+    ) if parts else ""
 
     return (
         f"┏━━━━━━━━━━━━━━━━━━━━━\n"
         f"┃ {medal}#{i}{name_part}  ⭐ {r['score']:.0f}/100\n"
+        f"{parts_line}"
         f"┃ 🔗 {r['address']}\n"
         f"┃ 💰 موجودی: ${r['account_value']:,.0f}  |  🎂 {r['age_days']} روز\n"
         f"┃ ✅ ماه مثبت: {r['positive_months']}/{r['valid_months']} "
         f"({r['positive_ratio']*100:.0f}%)\n"
         f"┃\n"
+        f"┃ 📊 میانگین سود ماهانه: {roi_str(r['avg_monthly_roi'])}\n"
         f"┃ 📈 وین‌ریت: {ts['win_rate']*100:.0f}% ({ts['n']} معامله)\n"
         f"┃ ⚖️ ریسک به ریوارد: {rr_display}\n"
         f"┃    میانگین سود: {pnl_str(ts['avg_win'])} | "
@@ -587,8 +613,11 @@ def send_telegram(message_or_chunks):
         print("خطا: توکن یا Chat ID تنظیم نشده است.")
         return
 
-    chunks = ([message_or_chunks] if isinstance(message_or_chunks, str)
-              else message_or_chunks)
+    chunks = (
+        [message_or_chunks]
+        if isinstance(message_or_chunks, str)
+        else message_or_chunks
+    )
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     total = len(chunks)
     for idx, chunk in enumerate(chunks, 1):
