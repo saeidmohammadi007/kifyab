@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ادغام نتایج chunkها و ارسال Top N به تلگرام (بر اساس امتیاز)"""
-import os, glob, json, time, datetime as dt, requests
+"""ادغام نتایج chunkها و ارسال Top N بر اساس امتیاز به تلگرام"""
+import os
+import glob
+import json
+import time
+import datetime as dt
+import requests
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -61,7 +66,6 @@ def main():
         if a not in seen or t["score"] > seen[a]["score"]:
             seen[a] = t
     passed = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
-
     log(f"مجموع پس از ادغام: {len(passed)}")
 
     if not passed:
