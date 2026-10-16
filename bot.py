@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-اسکنر لیدربورد Hyperliquid (نسخه موازی)
-هر Runner یک chunk از کاندیدها را اسکن می‌کند و نتیجه را در JSON ذخیره می‌کند.
+اسکنر لیدربورد Hyperliquid — نسخه امتیازدهی
+هیچ فیلتری اعمال نمی‌شود؛ هر تریدر امتیاز ۰ تا ۱۰۰ می‌گیرد و بر اساس امتیاز رتبه‌بندی می‌شود.
 """
 import os
 import sys
@@ -13,19 +13,30 @@ import datetime as dt
 import requests
 import ccxt
 
+# ---------------- وزن‌های امتیازدهی ----------------
+W_WIN_RATE = 20   # وین ریت
+W_AVG_ROI  = 20   # میانگین سود ۶ ماه اخیر
+W_MIN_ROI  = 30   # کمترین ماه (ثبات)
+W_MONTHS   = 15   # تعداد ماه سابقه
+W_LBANK    = 15   # سهم ارزهای البانک
+# مجموع = 100
+
+# نقاط مرجع برای نرمال‌سازی
+WR_MAX      = 1.00     # وین ریت 100% → امتیاز کامل
+AVG_ROI_MAX = 0.20     # میانگین 20% → امتیاز کامل
+MIN_ROI_LO  = -0.05    # کمترین ماه = -5% → 0 امتیاز
+MIN_ROI_HI  = 0.10     # کمترین ماه = +10% → امتیاز کامل
+MONTHS_MAX  = 12       # 12 ماه سابقه → امتیاز کامل
+
 # ---------------- تنظیمات ----------------
-MIN_MONTH_ROI = 0.05
-MIN_MONTHS = 6
-MIN_LBANK_SHARE = 0.90
-AVG_MONTHS = 6
-MIN_ACCOUNT_VALUE = 50
-MIN_BASE = 50
+MIN_ACCOUNT_VALUE = 50   # فقط برای حذف حساب‌های خیلی ریز (از لیدربورد، بدون API اضافه)
+AVG_MONTHS = 6           # چند ماه اخیر برای میانگین
+WIN_RATE_TRADES = 100    # روی چند معامله بسته‌شده اخیر
+MIN_BASE = 50            # حداقل سرمایه پایه برای محاسبه ROI
 MAX_CANDIDATES = None
 TOP_N = 100
-DELAY = 1.0
-
-MIN_WIN_RATE = 0.40
-WIN_RATE_TRADES = 100
+DELAY = 0.3              # فاصله بین درخواست‌ها
+TOP_PER_CHUNK = 500      # هر chunk چند نتیجه برتر را ذخیره کند
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
 LB_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -33,17 +44,11 @@ LB_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ---- ورودی‌های موازی‌سازی ----
 CHUNK_INDEX = int(os.environ.get("CHUNK_INDEX", "0"))
 CHUNK_TOTAL = int(os.environ.get("CHUNK_TOTAL", "1"))
 
-# ---- ورودی‌های اختیاری از ورک‌فلو ----
 if os.environ.get("TOP_N"):
     TOP_N = int(os.environ["TOP_N"])
-if os.environ.get("MIN_WIN_RATE_ENV"):
-    MIN_WIN_RATE = float(os.environ["MIN_WIN_RATE_ENV"])
-if os.environ.get("MIN_LBANK_SHARE_ENV"):
-    MIN_LBANK_SHARE = float(os.environ["MIN_LBANK_SHARE_ENV"])
 
 S = requests.Session()
 S.headers.update({"User-Agent": "hl-scanner/1.0"})
@@ -59,12 +64,12 @@ def hl_post(payload, retries=6):
         try:
             r = S.post(INFO_URL, json=payload, timeout=30)
             if r.status_code == 429:
-                time.sleep(5 * (i + 1))
+                time.sleep(3 * (i + 1))
                 continue
             r.raise_for_status()
             return r.json()
         except Exception:
-            time.sleep(2 * (i + 1))
+            time.sleep(1.5 * (i + 1))
     return None
 
 
@@ -109,10 +114,8 @@ def load_lbank_coins():
             base = market.get('base')
             if base:
                 coins.add(base.upper())
-
     if not coins:
         raise RuntimeError("CCXT لیست ارزهای فیوچرز البانک را برنگرداند")
-
     log(f"[LBank/CCXT] تعداد ارزهای فیوچرز: {len(coins)}")
     return coins
 
@@ -219,41 +222,52 @@ def lbank_share(addr, lbank, now):
     return ok / len(coins), ok, len(coins)
 
 
-# ---------------- وین ریت ----------------
+# ---------------- وین ریت (هر تعداد معامله) ----------------
 def get_win_rate(addr, n=WIN_RATE_TRADES):
+    """وین ریت آخرین n معامله بسته‌شده؛ اگر کمتر بود، همان تعداد موجود"""
     fills = hl_post({"type": "userFills", "user": addr})
     time.sleep(DELAY)
     if not fills:
         return None, 0
     closed = [f for f in fills if abs(float(f.get("closedPnl", 0) or 0)) > 0]
-    if len(closed) < n:
-        return None, len(closed)
+    if len(closed) == 0:
+        return None, 0
     closed.sort(key=lambda f: int(f["time"]))
-    closed = closed[-n:]
+    if len(closed) > n:
+        closed = closed[-n:]
+    total = len(closed)
     wins = sum(1 for f in closed if float(f["closedPnl"]) > 0)
-    return wins / n, n
+    return wins / total, total
 
 
-# ---------------- ارسال نتایج ----------------
-def send_results(passed, now):
-    if not passed:
-        tg_send("🔎 اسکن Hyperliquid تمام شد؛ هیچ تریدری با همه شرط‌ها پیدا نشد.")
-        return
-    head = (f"🏆 نتایج اسکن Hyperliquid ({now:%Y-%m-%d})\n"
-            f"تعداد تریدر پیدا شده: {len(passed)}\n"
-            f"نمایش {min(TOP_N, len(passed))} نتیجه برتر\n")
-    lines = [head]
-    for n, t in enumerate(passed[:TOP_N], 1):
-        months_txt = " | ".join(f"{m[5:]}: {x*100:.0f}%" for m, x in t["last"])
-        lines.append(
-            f"{n}) میانگین سود ۶ ماه: <b>{t['avg']*100:.1f}%</b>\n"
-            f"<code>{t['addr']}</code>\n"
-            f"سابقه: {t['months']} ماه | کمترین ماه: {t['min']*100:.1f}%\n"
-            f"وین ریت {t['win_n']} معامله اخیر: <b>{t['win_rate']*100:.1f}%</b>\n"
-            f"ارز البانک: {t['ok']}/{t['total']} ({t['share']*100:.0f}%)\n"
-            f"ماه‌ها: {months_txt}\n"
-        )
-    tg_send("\n".join(lines))
+# ---------------- محاسبه امتیاز ----------------
+def compute_score(wr, avg_roi, min_roi, months, share):
+    """امتیاز 0-100 از معیارهای داده‌شده. None = 0 امتیاز آن معیار"""
+    # وین ریت
+    wr_pts = 0.0
+    if wr is not None:
+        wr_pts = max(0.0, min(1.0, wr / WR_MAX)) * W_WIN_RATE
+
+    # میانگین سود
+    avg_pts = 0.0
+    if avg_roi is not None:
+        avg_pts = max(0.0, min(1.0, avg_roi / AVG_ROI_MAX)) * W_AVG_ROI
+
+    # کمترین ماه (ثبات)
+    min_pts = 0.0
+    if min_roi is not None:
+        norm = (min_roi - MIN_ROI_LO) / (MIN_ROI_HI - MIN_ROI_LO)
+        min_pts = max(0.0, min(1.0, norm)) * W_MIN_ROI
+
+    # سابقه
+    months_pts = 0.0
+    if months:
+        months_pts = max(0.0, min(1.0, months / MONTHS_MAX)) * W_MONTHS
+
+    # سهم البانک
+    lbank_pts = max(0.0, min(1.0, share or 0.0)) * W_LBANK
+
+    return wr_pts + avg_pts + min_pts + months_pts + lbank_pts
 
 
 # ---------------- اجرای اصلی ----------------
@@ -277,55 +291,89 @@ def main():
     if MAX_CANDIDATES:
         cands = cands[:MAX_CANDIDATES]
 
-    # ---- تقسیم بین Runnerها (stride برای توزیع متوازن) ----
     if CHUNK_TOTAL > 1:
         cands = cands[CHUNK_INDEX::CHUNK_TOTAL]
-        log(f"[Chunk {CHUNK_INDEX}/{CHUNK_TOTAL}] تعداد کاندید این بخش: {len(cands)}")
+        log(f"[Chunk {CHUNK_INDEX}/{CHUNK_TOTAL}] تعداد کاندید: {len(cands)}")
     else:
-        log(f"کاندیدا برای بررسی عمیق: {len(cands)}")
+        log(f"کاندیدا برای بررسی: {len(cands)}")
 
-    passed = []
+    scored = []
     for i, addr in enumerate(cands, 1):
-        if i % 50 == 0:
-            log(f"  بررسی {i}/{len(cands)} | عبور کرده: {len(passed)}")
+        if i % 100 == 0:
+            log(f"  بررسی {i}/{len(cands)} | امتیازگرفته: {len(scored)}")
 
+        # وین ریت
         wr, wr_n = get_win_rate(addr)
-        if wr is None or wr < MIN_WIN_RATE:
+        if wr is None:
+            # هیچ معامله بسته‌شده‌ای ندارد → امتیاز 0 برای همه معیارها
             continue
 
-        rois = monthly_rois(addr, now)
-        if not rois or len(rois) < MIN_MONTHS:
-            continue
-        if any(x < MIN_MONTH_ROI for _, x in rois):
-            continue
+        # ROI ماهانه
+        rois = monthly_rois(addr, now) or []
+        # حذف ماه‌های نامعتبر (inf-)
+        valid_rois = [(m, x) for m, x in rois if x != float("-inf")]
+        if valid_rois:
+            last = [x for _, x in valid_rois[-AVG_MONTHS:]]
+            avg_roi = sum(last) / len(last)
+            min_roi = min(x for _, x in valid_rois)
+            months = len(valid_rois)
+            last_months = valid_rois[-AVG_MONTHS:]
+        else:
+            avg_roi = min_roi = None
+            months = 0
+            last_months = []
 
-        share, ok, total = lbank_share(addr, lbank, now)
-        if share < MIN_LBANK_SHARE:
-            continue
+        # سهم البانک
+        share, ok, total_coins = lbank_share(addr, lbank, now)
 
-        last = [x for _, x in rois[-AVG_MONTHS:]]
-        passed.append({
+        # امتیاز
+        score = compute_score(wr, avg_roi, min_roi, months, share)
+
+        scored.append({
             "addr": addr,
-            "avg": sum(last) / len(last),
-            "months": len(rois),
-            "min": min(x for _, x in rois),
-            "share": share, "ok": ok, "total": total,
+            "score": round(score, 2),
             "win_rate": wr, "win_n": wr_n,
-            "last": rois[-AVG_MONTHS:],
+            "avg": avg_roi if avg_roi is not None else 0.0,
+            "min": min_roi if min_roi is not None else 0.0,
+            "months": months,
+            "share": share, "ok": ok, "total": total_coins,
+            "last": last_months,
         })
 
-    passed.sort(key=lambda x: x["avg"], reverse=True)
-    log(f"تعداد نهایی این chunk: {len(passed)}")
+    # مرتب بر اساس امتیاز + نگه‌داشتن top per chunk
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:TOP_PER_CHUNK]
+    log(f"امتیاز گرفته: {len(scored)} | ذخیره top {len(top)}")
 
-    # ---- ذخیره در JSON برای ادغام ----
     out_file = f"results_{CHUNK_INDEX}.json"
     with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(passed, f, ensure_ascii=False)
+        json.dump(top, f, ensure_ascii=False)
     log(f"ذخیره شد: {out_file}")
 
-    # ---- اگر تک‌runner بودیم، مستقیم هم به تلگرام بفرست ----
+    # اگر تک‌runner بودیم، مستقیم هم بفرست
     if CHUNK_TOTAL == 1:
-        send_results(passed, now)
+        send_results(scored, now)
+
+
+def send_results(passed, now):
+    if not passed:
+        tg_send("🔎 اسکن Hyperliquid تمام شد؛ هیچ تریدری امتیاز نگرفت.")
+        return
+    head = (f"🏆 نتایج اسکن Hyperliquid ({now:%Y-%m-%d})\n"
+            f"تعداد کل امتیازگرفته: {len(passed)}\n"
+            f"نمایش {min(TOP_N, len(passed))} نتیجه برتر\n")
+    lines = [head]
+    for n, t in enumerate(passed[:TOP_N], 1):
+        months_txt = " | ".join(f"{m[5:]}: {x*100:.0f}%" for m, x in t["last"]) or "—"
+        lines.append(
+            f"{n}) <b>امتیاز: {t['score']:.1f}</b> | میانگین ۶ ماه: {t['avg']*100:.1f}%\n"
+            f"<code>{t['addr']}</code>\n"
+            f"سابقه: {t['months']} ماه | کمترین ماه: {t['min']*100:.1f}%\n"
+            f"وین ریت {t['win_n']} معامله اخیر: {t['win_rate']*100:.1f}%\n"
+            f"ارز البانک: {t['ok']}/{t['total']} ({t['share']*100:.0f}%)\n"
+            f"ماه‌ها: {months_txt}\n"
+        )
+    tg_send("\n".join(lines))
 
 
 if __name__ == "__main__":
