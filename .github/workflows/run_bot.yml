@@ -15,7 +15,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -23,14 +23,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+
       - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install requests ccxt
+
       - name: Run chunk ${{ matrix.chunk }}
         env:
           CHUNK_INDEX:         ${{ matrix.chunk }}
@@ -38,6 +41,7 @@ jobs:
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python bot.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: results-${{ matrix.chunk }}
@@ -49,16 +53,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - run: pip install requests
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: results-*
           merge-multiple: true
-      - name: Merge
+
+      - name: Merge & Send
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
