@@ -14,11 +14,11 @@ INFO_URL = "https://api.hyperliquid.xyz/info"
 # ------------------ تنظیمات ------------------
 LIMIT = 20                       # تعداد تریدر نمایش داده‌شده
 TOP_CANDIDATES = 500             # تعداد تریدر برتر بر اساس نسبت ماه‌های مثبت
-MONTHS_TO_CHECK = 8              # ✅ تعداد ماه‌های کامل اخیر برای شمارش
+MONTHS_TO_CHECK = 6              # ✅ تعداد ماه‌های کامل اخیر برای شمارش
 PROFIT_MONTHS = 6                # بازه‌ی محاسبه‌ی سود (ماه)
 
 MIN_AGE_DAYS = 180               # ✅ حداقل سابقه (۶ ماه)
-MIN_VALID_MONTHS = 6             # ✅ حداقل ۶ ماه داده‌ی معتبر (از ۸)
+MIN_VALID_MONTHS = 5             # ✅ حداقل ۵ ماه داده‌ی معتبر (از ۶)
 
 MIN_ACCOUNT_VALUE = 0
 MIN_WEEK_VLM = 1000
