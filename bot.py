@@ -16,6 +16,7 @@ import time
 import bisect
 import datetime as dt
 import requests
+import ccxt
 
 # ---------------- تنظیمات ----------------
 MIN_MONTH_ROI = 0.05        # حداقل سود هر ماه (5٪)
@@ -23,21 +24,28 @@ MIN_MONTHS = 6              # حداقل تعداد ماه کامل سابقه
 MIN_LBANK_SHARE = 0.90      # حداقل سهم ارزهای موجود در البانک
 AVG_MONTHS = 6              # میانگین سود چند ماه اخیر برای رتبه‌بندی
 MIN_ACCOUNT_VALUE = 50      # حداقل ارزش حساب (دلار) برای حذف حساب‌های ریز/نویزی
-MIN_BASE = 50               # حداقل سرمایه پایه ماه برای محاسبه ROI (هم‌راستا با MIN_ACCOUNT_VALUE)
-MAX_CANDIDATES = None       # None = بدون سقف (همه بررسی می‌شوند)
+MIN_BASE = 50               # حداقل سرمایه پایه ماه برای محاسبه ROI
+MAX_CANDIDATES = None       # None = بدون سقف
 TOP_N = 100                 # تعداد نتایج ارسالی
-DELAY = 1.0                 # فاصله بین درخواست‌ها (محدودیت نرخ API)
+DELAY = 1.0                 # فاصله بین درخواست‌ها
 
 # ---- شرط وین ریت ----
 MIN_WIN_RATE = 0.40         # حداقل وین ریت (40٪)
-WIN_RATE_TRADES = 100       # روی چند معامله بسته‌شده اخیر محاسبه شود
+WIN_RATE_TRADES = 100       # روی چند معامله بسته‌شده اخیر
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
 LB_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
-LBANK_URL = "https://lbkperp.lbank.com/cfd/openApi/v1/pub/instrument?productGroup=Swap&_=1"
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ورودی‌های اختیاری از ورک‌فلو
+if os.environ.get("TOP_N"):
+    TOP_N = int(os.environ["TOP_N"])
+if os.environ.get("MIN_WIN_RATE_ENV"):
+    MIN_WIN_RATE = float(os.environ["MIN_WIN_RATE_ENV"])
+if os.environ.get("MIN_LBANK_SHARE_ENV"):
+    MIN_LBANK_SHARE = float(os.environ["MIN_LBANK_SHARE_ENV"])
 
 S = requests.Session()
 S.headers.update({"User-Agent": "hl-scanner/1.0"})
@@ -74,8 +82,7 @@ def tg_send(text):
         cur += line + "\n"
     if cur.strip():
         chunks.append(cur)
-    total = len(chunks)
-    for idx, c in enumerate(chunks, 1):
+    for c in chunks:
         try:
             S.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -88,21 +95,28 @@ def tg_send(text):
         time.sleep(0.5)
 
 
-# ---------------- ارزهای البانک ----------------
+# ---------------- ارزهای فیوچرز البانک (فقط CCXT) ----------------
 def load_lbank_coins():
-    r = S.get(LBANK_URL, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("data") or []
+    """دریافت لیست ارزهای فیوچرز البانک با CCXT"""
+    exchange = ccxt.lbank({
+        'options': {'defaultType': 'swap'},
+        'enableRateLimit': True,
+        'timeout': 30000,
+    })
+    markets = exchange.load_markets()
     coins = set()
-    for it in data:
-        base = it.get("baseCurrency")
-        if not base:
-            sym = str(it.get("symbol", ""))
-            base = sym[:-4] if sym.endswith("USDT") else sym
-        if base:
-            coins.add(base.upper())
+    for symbol, market in markets.items():
+        if not market:
+            continue
+        if (market.get('swap') or market.get('future')) and market.get('active'):
+            base = market.get('base')
+            if base:
+                coins.add(base.upper())
+
     if not coins:
-        raise RuntimeError("لیست ارزهای البانک خالی بود")
+        raise RuntimeError("CCXT لیست ارزهای فیوچرز البانک را برنگرداند")
+
+    log(f"[LBank/CCXT] تعداد ارزهای فیوچرز: {len(coins)}")
     return coins
 
 
@@ -123,7 +137,6 @@ def coin_on_lbank(c, lbank):
 
 # ---------------- سود ماهانه (بدون واریز/برداشت) ----------------
 def val_at(series, ts):
-    """آخرین مقدار سری در یا قبل از ts؛ اگر قبل از شروع باشد None"""
     times = [p[0] for p in series]
     i = bisect.bisect_right(times, ts) - 1
     return series[i][1] if i >= 0 else None
@@ -166,18 +179,17 @@ def monthly_rois(addr, now):
     res = []
     for s, e in months:
         s_ms, e_ms = int(s.timestamp() * 1000), int(e.timestamp() * 1000)
-        p_s = val_at(pnl, s_ms) or 0.0          # قبل از شروع حساب: صفر
+        p_s = val_at(pnl, s_ms) or 0.0
         p_e = val_at(pnl, e_ms)
         if p_e is None:
             return None
-        month_pnl = p_e - p_s                    # فقط سود/زیان؛ واریز و برداشت در PnL نیست
+        month_pnl = p_e - p_s
         a_s = val_at(av, s_ms)
         inside = [v for t, v in av if s_ms <= t <= e_ms]
         cands = ([a_s] if a_s else []) + inside
         if not cands:
             res.append((s.strftime("%Y-%m"), float("-inf")))
             continue
-        # پایه محافظه‌کارانه: بیشتر از سرمایه ابتدای ماه و میانگین ماه
         base = max(a_s or 0.0, sum(inside) / len(inside) if inside else 0.0)
         if base < MIN_BASE:
             res.append((s.strftime("%Y-%m"), float("-inf")))
@@ -214,14 +226,13 @@ def lbank_share(addr, lbank, now):
 
 # ---------------- وین ریت ----------------
 def get_win_rate(addr, n=WIN_RATE_TRADES):
-    """وین ریت آخرین n معامله بسته‌شده (بر اساس closedPnl != 0)"""
     fills = hl_post({"type": "userFills", "user": addr})
     time.sleep(DELAY)
     if not fills:
         return None, 0
     closed = [f for f in fills if abs(float(f.get("closedPnl", 0) or 0)) > 0]
     if len(closed) < n:
-        return None, len(closed)   # معامله بسته‌شده کافی ندارد
+        return None, len(closed)
     closed.sort(key=lambda f: int(f["time"]))
     closed = closed[-n:]
     wins = sum(1 for f in closed if float(f["closedPnl"]) > 0)
@@ -237,7 +248,6 @@ def main():
     rows = S.get(LB_URL, timeout=120).json()["leaderboardRows"]
     log(f"تعداد کل تریدرها در لیدربورد: {len(rows)}")
 
-    # ---- بدون پیش‌فیلتر: همه تریدرها (فقط فیلتر حداقلی ارزش حساب) ----
     cands = []
     for r in rows:
         try:
@@ -249,14 +259,13 @@ def main():
 
     if MAX_CANDIDATES:
         cands = cands[:MAX_CANDIDATES]
-    log(f"کاندیدا برای بررسی عمیق (بدون پیش‌فیلتر): {len(cands)}")
+    log(f"کاندیدا برای بررسی عمیق: {len(cands)}")
 
     passed = []
     for i, addr in enumerate(cands, 1):
         if i % 50 == 0:
             log(f"  بررسی {i}/{len(cands)} | عبور کرده: {len(passed)}")
 
-        # ---- شرط وین ریت ۱۰۰ معامله اخیر (سریع، اول چک می‌شود) ----
         wr, wr_n = get_win_rate(addr)
         if wr is None or wr < MIN_WIN_RATE:
             continue
