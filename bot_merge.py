@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-ادغام نتایج همه chunkها و ارسال Top N به تلگرام
-"""
-import os
-import glob
-import json
-import time
-import datetime as dt
-import requests
+"""ادغام نتایج chunkها و ارسال Top N به تلگرام (بر اساس امتیاز)"""
+import os, glob, json, time, datetime as dt, requests
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 TOP_N = int(os.environ.get("TOP_N", "100"))
 
 S = requests.Session()
-S.headers.update({"User-Agent": "hl-scanner-merge/1.0"})
 
 
 def log(*a):
@@ -49,9 +41,8 @@ def tg_send(text):
 
 def main():
     now = dt.datetime.now(dt.timezone.utc)
-
     files = sorted(glob.glob("results_*.json"))
-    log(f"فایل‌های یافت‌شده: {files}")
+    log(f"فایل‌ها: {files}")
 
     all_passed = []
     for f in files:
@@ -61,32 +52,33 @@ def main():
                 all_passed.extend(data)
                 log(f"  {f}: {len(data)} مورد")
         except Exception as e:
-            log(f"  خطا در خواندن {f}: {e}")
+            log(f"  خطا در {f}: {e}")
 
-    # حذف تکراری‌ها بر اساس آدرس
+    # حذف تکراری بر اساس آدرس (بالاترین امتیاز)
     seen = {}
     for t in all_passed:
-        seen[t["addr"]] = t
-    passed = list(seen.values())
-    passed.sort(key=lambda x: x["avg"], reverse=True)
+        a = t["addr"]
+        if a not in seen or t["score"] > seen[a]["score"]:
+            seen[a] = t
+    passed = sorted(seen.values(), key=lambda x: x["score"], reverse=True)
 
     log(f"مجموع پس از ادغام: {len(passed)}")
 
     if not passed:
-        tg_send("🔎 اسکن Hyperliquid تمام شد؛ هیچ تریدری با همه شرط‌ها پیدا نشد.")
+        tg_send("🔎 اسکن Hyperliquid تمام شد؛ هیچ تریدری امتیاز نگرفت.")
         return
 
     head = (f"🏆 نتایج اسکن Hyperliquid ({now:%Y-%m-%d})\n"
-            f"تعداد تریدر پیدا شده: {len(passed)}\n"
+            f"تعداد کل امتیازگرفته: {len(passed)}\n"
             f"نمایش {min(TOP_N, len(passed))} نتیجه برتر\n")
     lines = [head]
     for n, t in enumerate(passed[:TOP_N], 1):
-        months_txt = " | ".join(f"{m[5:]}: {x*100:.0f}%" for m, x in t["last"])
+        months_txt = " | ".join(f"{m[5:]}: {x*100:.0f}%" for m, x in t["last"]) or "—"
         lines.append(
-            f"{n}) میانگین سود ۶ ماه: <b>{t['avg']*100:.1f}%</b>\n"
+            f"{n}) <b>امتیاز: {t['score']:.1f}</b> | میانگین ۶ ماه: {t['avg']*100:.1f}%\n"
             f"<code>{t['addr']}</code>\n"
             f"سابقه: {t['months']} ماه | کمترین ماه: {t['min']*100:.1f}%\n"
-            f"وین ریت {t['win_n']} معامله اخیر: <b>{t['win_rate']*100:.1f}%</b>\n"
+            f"وین ریت {t['win_n']} معامله اخیر: {t['win_rate']*100:.1f}%\n"
             f"ارز البانک: {t['ok']}/{t['total']} ({t['share']*100:.0f}%)\n"
             f"ماه‌ها: {months_txt}\n"
         )
