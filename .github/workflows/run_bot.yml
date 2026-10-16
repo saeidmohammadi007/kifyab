@@ -16,7 +16,6 @@ on:
         required: false
         default: "0.90"
 
-# جلوگیری از اجرای هم‌زمان
 concurrency:
   group: hl-scanner
   cancel-in-progress: false
@@ -24,7 +23,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # حداکثر مجاز گیت‌هاب 360 دقیقه
+    timeout-minutes: 350
 
     steps:
       - name: Checkout repository
@@ -39,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests ccxt
 
       - name: Run scanner
         env:
