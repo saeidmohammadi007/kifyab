@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-اسکنر لیدربورد Hyperliquid — نسخه نهایی (v3.4)
+اسکنر لیدربورد Hyperliquid — نسخه نهایی (v3.5)
 - گیت سابقه (حداقل ۴ ماه)
 - گیت معاملات بسته (حداقل ۳۰ سفارش در ۶ ماه)
 - گیت بلواپ (حذف ماه بدتر از -۲۰٪)
-- میانگین هندسی ROI به‌جای حسابی
+- میانگین حسابی ROI (جمع / تعداد)
 - شرط حداقل تنوع ارز برای معیار البانک
 - ضریب سابقه نهایی
 - نمایش Max Drawdown و پایداری در خروجی
@@ -64,7 +64,7 @@ if os.environ.get("TOP_N"):
     TOP_N = int(os.environ["TOP_N"])
 
 S = requests.Session()
-S.headers.update({"User-Agent": "hl-scanner/3.4"})
+S.headers.update({"User-Agent": "hl-scanner/3.5"})
 
 
 def log(*a):
@@ -269,12 +269,12 @@ def lbank_share_from_fills(fills, lbank):
 
 
 # ---------------- متریک‌های اضافی ----------------
-def geo_mean_roi(rois_pairs):
+def arith_mean_roi(rois_pairs):
+    """میانگین حسابی: جمع همه ROIها تقسیم بر تعداد."""
     vals = [r for _, r in rois_pairs]
     if not vals:
         return 0.0
-    logs = [math.log(max(1 + r, 0.01)) for r in vals]
-    return math.exp(sum(logs) / len(logs)) - 1.0
+    return sum(vals) / len(vals)
 
 
 def compute_drawdown(rois_pairs):
@@ -381,7 +381,7 @@ def send_results(passed, stats, now):
         diversity_warn = " ⚠️ کم‌تنوع" if t["total"] < MIN_COINS_FOR_LBANK else ""
         lines.append(
             f"{n}) <b>امتیاز: {t['score']:.1f}</b> | "
-            f"میانگین ۶ ماه (هندسی): {t['avg']*100:.1f}%\n"
+            f"میانگین ۶ ماه (حسابی): {t['avg']*100:.1f}%\n"
             f"<code>{t['addr']}</code>\n"
             f"سابقه: {t['months']} ماه (ضریب {t['hist_factor']:.2f}) | "
             f"کمترین ماه: {t['min']*100:.1f}%\n"
@@ -472,7 +472,7 @@ def main():
             continue
 
         last_months = rois[-AVG_MONTHS:]
-        avg_roi   = geo_mean_roi(last_months)
+        avg_roi   = arith_mean_roi(last_months)   # ← میانگین حسابی
         drawdown  = compute_drawdown(rois)
         stability = compute_stability(rois)
 
