@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-اسکنر لیدربورد Hyperliquid — نسخه اصلاح‌شده (v2)
+اسکنر لیدربورد Hyperliquid — نسخه نهایی (v3.2)
 - گیت سابقه (حداقل ۴ ماه)
-- گیت معاملات بسته (حداقل ۴۰ در ۶ ماه)
+- گیت معاملات بسته (حداقل ۳۰ سفارش در ۶ ماه)
 - گیت بلواپ (حذف ماه بدتر از -۲۰٪)
 - میانگین هندسی ROI به‌جای حسابی
 - ضریب اعتماد وین‌ریت بر اساس تعداد معاملات
 - شرط حداقل تنوع ارز برای معیار البانک
 - ضریب سابقه نهایی
 - نمایش Max Drawdown و پایداری در خروجی
+- وین‌ریت بر اساس oid (سفارش واقعی)
+- aggregateByTime=False
 """
 import os
 import sys
@@ -18,6 +20,7 @@ import bisect
 import json
 import math
 import datetime as dt
+from collections import defaultdict
 import requests
 import ccxt
 
@@ -33,11 +36,11 @@ MIN_ACCOUNT_VALUE   = 50
 AVG_MONTHS          = 6
 WIN_RATE_TRADES     = 100
 
-MIN_MONTHS_REQUIRED = 4       # گیت سابقه
-MIN_CLOSED_TRADES   = 40      # گیت معاملات بسته در ۶ ماه
-MIN_TRADES_WIN_RATE = 30      # حداقل معاملات برای معیار وین‌ریت
-MIN_COINS_FOR_LBANK = 3       # حداقل تنوع ارز برای معیار البانک
-BLOWUP_THRESHOLD    = -0.20   # ماه بدتر از این → حذف
+MIN_MONTHS_REQUIRED = 4
+MIN_CLOSED_TRADES   = 30
+MIN_TRADES_WIN_RATE = 30
+MIN_COINS_FOR_LBANK = 3
+BLOWUP_THRESHOLD    = -0.20
 
 MIN_BASE            = 50
 MAX_CANDIDATES      = None
@@ -45,7 +48,7 @@ TOP_N               = 100
 DELAY               = 0.25
 TOP_PER_CHUNK       = 800
 
-HISTORY_FULL_MONTHS = 6       # ضریب سابقه در ۶ ماه = ۱.۰
+HISTORY_FULL_MONTHS = 6
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
 LB_URL   = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
@@ -60,7 +63,7 @@ if os.environ.get("TOP_N"):
     TOP_N = int(os.environ["TOP_N"])
 
 S = requests.Session()
-S.headers.update({"User-Agent": "hl-scanner/2.0"})
+S.headers.update({"User-Agent": "hl-scanner/3.2"})
 
 
 def log(*a):
@@ -202,11 +205,12 @@ def monthly_rois(addr, now):
 
 # ---------------- fills ----------------
 def get_fills_6mo(addr, now):
+    """aggregateByTime=False برای دریافت fillهای خام با oid."""
     start_ms = int((now - dt.timedelta(days=183)).timestamp() * 1000)
     out, t = [], start_ms
     for _ in range(6):
         d = hl_post({"type": "userFillsByTime", "user": addr,
-                     "startTime": t, "aggregateByTime": True})
+                     "startTime": t, "aggregateByTime": False})
         time.sleep(DELAY)
         if not d:
             break
@@ -217,21 +221,42 @@ def get_fills_6mo(addr, now):
     return out
 
 
-def win_rate_from_fills(fills):
+def win_rate_by_oid(fills):
     """
+    وین‌ریت بر اساس گروه‌بندی fillها روی oid (شناسه سفارش).
+    هر سفارش = یک معامله، حتی اگر در چند fill پر شده باشد.
+
     برمی‌گرداند: (win_rate, n_used, n_closed_total)
-      - win_rate روی WIN_RATE_TRADES معامله آخر
-      - n_used = تعداد معاملات بسته‌ای که در محاسبه وین‌ریت استفاده شد
-      - n_closed_total = کل معاملات بسته در ۶ ماه (برای گیت)
     """
-    closed = [f for f in fills if abs(float(f.get("closedPnl", 0) or 0)) > 0]
+    orders = defaultdict(lambda: {
+        "pnl": 0.0,
+        "has_closed": False,
+        "time": 0,
+    })
+
+    for f in fills:
+        oid = f.get("oid")
+        if oid is None:
+            oid = f.get("hash") or f.get("time")
+            if oid is None:
+                continue
+
+        pnl = float(f.get("closedPnl", 0) or 0)
+        o = orders[oid]
+        o["time"] = max(o["time"], int(f.get("time", 0)))
+        if abs(pnl) > 0:
+            o["pnl"] += pnl
+            o["has_closed"] = True
+
+    closed = [o for o in orders.values() if o["has_closed"]]
     if not closed:
         return None, 0, 0
-    closed.sort(key=lambda f: int(f["time"]))
+
+    closed.sort(key=lambda x: x["time"])
     total_closed = len(closed)
     used = closed[-WIN_RATE_TRADES:] if len(closed) > WIN_RATE_TRADES else closed
     n = len(used)
-    wins = sum(1 for f in used if float(f["closedPnl"]) > 0)
+    wins = sum(1 for o in used if o["pnl"] > 0)
     return wins / n, n, total_closed
 
 
@@ -245,10 +270,6 @@ def lbank_share_from_fills(fills, lbank):
 
 # ---------------- متریک‌های اضافی ----------------
 def geo_mean_roi(rois_pairs):
-    """
-    میانگین هندسی بازدهی ماهانه — برای داده‌های پرنوسان دقیق‌تر از حسابی.
-    هر ماهی که -۱۰۰٪ یا بدتر باشد، 0.01 در نظر گرفته می‌شود (fallback).
-    """
     vals = [r for _, r in rois_pairs]
     if not vals:
         return 0.0
@@ -257,7 +278,6 @@ def geo_mean_roi(rois_pairs):
 
 
 def compute_drawdown(rois_pairs):
-    """حداکثر افت سرمایه از پیک (compounded monthly)."""
     if not rois_pairs:
         return 0.0
     equity, peak, max_dd = 1.0, 1.0, 0.0
@@ -273,7 +293,6 @@ def compute_drawdown(rois_pairs):
 
 
 def compute_stability(rois_pairs):
-    """نسبت میانگین به انحراف معیار بازدهی ماهانه (شبه-شارپ)."""
     vals = [r for _, r in rois_pairs]
     if len(vals) < 2:
         return 0.0
@@ -287,30 +306,21 @@ def compute_stability(rois_pairs):
 
 # ---------------- امتیازدهی ----------------
 def score_min_month(r):
-    """
-    -20% یا بدتر → -25 (جریمه، در عمل گیت بلواپ زودتر حذف می‌کند)
-    -10% → 0
-     0%  → 8
-    +5%  → 17
-    +10%+ → 20
-    """
     if r <= -0.20:  return -25.0
-    if r <= -0.10:  return -15 + (r + 0.20) * 150        # -15 → 0
-    if r <  0:      return (r + 0.10) / 0.10 * 8         # 0 → 8
-    if r <  0.05:   return 8 + (r / 0.05) * 9            # 8 → 17
-    if r <  0.10:   return 17 + ((r - 0.05) / 0.05) * 3  # 17 → 20
+    if r <= -0.10:  return -15 + (r + 0.20) * 150
+    if r <  0:      return (r + 0.10) / 0.10 * 8
+    if r <  0.05:   return 8 + (r / 0.05) * 9
+    if r <  0.10:   return 17 + ((r - 0.05) / 0.05) * 3
     return float(W_MIN_MO)
 
 
 def score_avg_roi(r):
-    """میانگین هندسی ۶ ماه: 0%→0 | 20%+→20."""
     if r is None or r <= 0: return 0.0
     if r >= 0.20:           return float(W_AVG_ROI)
     return (r / 0.20) * W_AVG_ROI
 
 
 def score_lbank(share, n_coins):
-    """سهم البانک با شرط حداقل تنوع ارز."""
     if n_coins < MIN_COINS_FOR_LBANK:
         return 0.0
     if share >= 0.90: return float(W_LBANK)
@@ -319,14 +329,12 @@ def score_lbank(share, n_coins):
 
 
 def score_months(m):
-    """سابقه: <4 ماه→0 | 6+ ماه→20."""
     if m >= 6: return float(W_MONTHS)
     if m <= 4: return 0.0
     return (m - 4) / 2.0 * W_MONTHS
 
 
 def score_win_rate(wr, n_used):
-    """وین‌ریت با ضریب اعتماد بر اساس تعداد معاملات."""
     if n_used < MIN_TRADES_WIN_RATE:
         return 0.0
     if wr is None or wr <= 0.30:
@@ -337,7 +345,6 @@ def score_win_rate(wr, n_used):
 
 
 def history_factor(months):
-    """ضریب سابقه: 0 در 0 ماه، 1 در 6+ ماه."""
     return min(months / HISTORY_FULL_MONTHS, 1.0)
 
 
@@ -350,7 +357,6 @@ def compute_score(wr, wr_n, avg_roi, min_roi, months, share, n_coins):
         score_win_rate(wr, wr_n)
     )
     hf = history_factor(months)
-    # امتیاز مثبت با ضریب سابقه کاهش می‌یابد، ولی جریمه‌ها کاهش نمی‌یابند
     if components > 0:
         return components * hf
     return components
@@ -383,7 +389,7 @@ def send_results(passed, stats, now):
             f"<code>{t['addr']}</code>\n"
             f"سابقه: {t['months']} ماه (ضریب {t['hist_factor']:.2f}) | "
             f"کمترین ماه: {t['min']*100:.1f}%\n"
-            f"وین ریت {t['win_n']}/{t['win_total']} معامله: {t['win_rate']*100:.1f}%\n"
+            f"وین ریت {t['win_n']}/{t['win_total']} سفارش: {t['win_rate']*100:.1f}%\n"
             f"ارز البانک: {t['ok']}/{t['total']} ({t['share']*100:.0f}%){diversity_warn}\n"
             f"حداکثر افت: {t['drawdown']*100:.1f}% | پایداری: {t['stability']:.2f}\n"
             f"ماه‌ها: {months_txt}\n"
@@ -439,7 +445,7 @@ def main():
             reject_reasons["no_fills"] += 1
             continue
 
-        wr, wr_used, wr_closed = win_rate_from_fills(fills)
+        wr, wr_used, wr_closed = win_rate_by_oid(fills)
         share, ok, total_coins = lbank_share_from_fills(fills, lbank)
 
         # گیت معاملات
@@ -456,7 +462,6 @@ def main():
 
         months = len(rois)
 
-        # گیت سابقه
         if months < MIN_MONTHS_REQUIRED:
             rejected += 1
             reject_reasons["few_months"] += 1
@@ -464,14 +469,13 @@ def main():
 
         min_roi = min(x for _, x in rois)
 
-        # گیت بلواپ
         if min_roi < BLOWUP_THRESHOLD:
             rejected += 1
             reject_reasons["blowup"] += 1
             continue
 
         last_months = rois[-AVG_MONTHS:]
-        avg_roi   = geo_mean_roi(last_months)      # میانگین هندسی
+        avg_roi   = geo_mean_roi(last_months)
         drawdown  = compute_drawdown(rois)
         stability = compute_stability(rois)
 
