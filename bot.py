@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-اسکنر لیدربورد Hyperliquid — نسخه نهایی (v3.2)
+اسکنر لیدربورد Hyperliquid — نسخه نهایی (v3.4)
 - گیت سابقه (حداقل ۴ ماه)
 - گیت معاملات بسته (حداقل ۳۰ سفارش در ۶ ماه)
 - گیت بلواپ (حذف ماه بدتر از -۲۰٪)
 - میانگین هندسی ROI به‌جای حسابی
-- ضریب اعتماد وین‌ریت بر اساس تعداد معاملات
 - شرط حداقل تنوع ارز برای معیار البانک
 - ضریب سابقه نهایی
 - نمایش Max Drawdown و پایداری در خروجی
-- وین‌ریت بر اساس oid (سفارش واقعی)
+- وین‌ریت بر اساس oid — فقط نمایشی، بدون اثر در امتیاز
+- امتیاز نهایی نرمال‌سازی‌شده به مقیاس ۱۰۰
 - aggregateByTime=False
 """
 import os
@@ -24,21 +24,22 @@ from collections import defaultdict
 import requests
 import ccxt
 
-# ---------------- وزن‌های مساوی (هر کدام 20) ----------------
+# ---------------- وزن‌های پایه (جمع = ۸۰، سپس به ۱۰۰ نرمال می‌شود) ----------------
 W_MIN_MO   = 20
 W_AVG_ROI  = 20
 W_LBANK    = 20
 W_MONTHS   = 20
-W_WIN_RATE = 20
+
+# ضریب نرمال‌سازی به مقیاس ۱۰۰ (۱۰۰ / ۸۰ = ۱.۲۵)
+SCALE_FACTOR = 100.0 / (W_MIN_MO + W_AVG_ROI + W_LBANK + W_MONTHS)
 
 # ---------------- گیت‌ها و آستانه‌ها ----------------
 MIN_ACCOUNT_VALUE   = 50
 AVG_MONTHS          = 6
-WIN_RATE_TRADES     = 100
+WIN_RATE_TRADES     = 100   # فقط برای نمایش وین‌ریت
 
 MIN_MONTHS_REQUIRED = 4
 MIN_CLOSED_TRADES   = 30
-MIN_TRADES_WIN_RATE = 30
 MIN_COINS_FOR_LBANK = 3
 BLOWUP_THRESHOLD    = -0.20
 
@@ -63,7 +64,7 @@ if os.environ.get("TOP_N"):
     TOP_N = int(os.environ["TOP_N"])
 
 S = requests.Session()
-S.headers.update({"User-Agent": "hl-scanner/3.2"})
+S.headers.update({"User-Agent": "hl-scanner/3.4"})
 
 
 def log(*a):
@@ -225,8 +226,7 @@ def win_rate_by_oid(fills):
     """
     وین‌ریت بر اساس گروه‌بندی fillها روی oid (شناسه سفارش).
     هر سفارش = یک معامله، حتی اگر در چند fill پر شده باشد.
-
-    برمی‌گرداند: (win_rate, n_used, n_closed_total)
+    خروجی فقط برای نمایش استفاده می‌شود.
     """
     orders = defaultdict(lambda: {
         "pnl": 0.0,
@@ -304,7 +304,7 @@ def compute_stability(rois_pairs):
     return mean / std
 
 
-# ---------------- امتیازدهی ----------------
+# ---------------- امتیازدهی (بدون وین‌ریت، مقیاس ۱۰۰) ----------------
 def score_min_month(r):
     if r <= -0.20:  return -25.0
     if r <= -0.10:  return -15 + (r + 0.20) * 150
@@ -334,32 +334,28 @@ def score_months(m):
     return (m - 4) / 2.0 * W_MONTHS
 
 
-def score_win_rate(wr, n_used):
-    if n_used < MIN_TRADES_WIN_RATE:
-        return 0.0
-    if wr is None or wr <= 0.30:
-        return 0.0
-    base = W_WIN_RATE if wr >= 1.0 else (wr - 0.30) / 0.70 * W_WIN_RATE
-    confidence = 0.3 + 0.7 * min(n_used / WIN_RATE_TRADES, 1.0)
-    return base * confidence
-
-
 def history_factor(months):
     return min(months / HISTORY_FULL_MONTHS, 1.0)
 
 
-def compute_score(wr, wr_n, avg_roi, min_roi, months, share, n_coins):
+def compute_score(avg_roi, min_roi, months, share, n_coins):
+    """
+    امتیاز نهایی — بدون وین‌ریت، مقیاس ۱۰۰.
+    - جمع خام اجزا: ۴×۲۰ = ۸۰
+    - ضرب در SCALE_FACTOR (۱.۲۵) → مقیاس ۱۰۰
+    - ضرب در ضریب سابقه (۰..۱)
+    """
     components = (
         score_min_month(min_roi) +
         score_avg_roi(avg_roi) +
         score_lbank(share, n_coins) +
-        score_months(months) +
-        score_win_rate(wr, wr_n)
+        score_months(months)
     )
     hf = history_factor(months)
-    if components > 0:
-        return components * hf
-    return components
+    scaled = components * SCALE_FACTOR
+    if scaled > 0:
+        return scaled * hf
+    return scaled
 
 
 # ---------------- ارسال نتایج ----------------
@@ -377,7 +373,7 @@ def send_results(passed, stats, now):
         f"🏆 نتایج اسکن Hyperliquid ({now:%Y-%m-%d})\n"
         f"کاندید: {stats['cands']} | رد در گیت: {stats['rejected']} | "
         f"امتیازگرفته: {stats['scored']}\n"
-        f"نمایش {min(TOP_N, len(passed))} نتیجه برتر\n"
+        f"نمایش {min(TOP_N, len(passed))} نتیجه برتر (حداکثر امتیاز: ۱۰۰)\n"
     )
     lines = [head]
     for n, t in enumerate(passed[:TOP_N], 1):
@@ -389,7 +385,7 @@ def send_results(passed, stats, now):
             f"<code>{t['addr']}</code>\n"
             f"سابقه: {t['months']} ماه (ضریب {t['hist_factor']:.2f}) | "
             f"کمترین ماه: {t['min']*100:.1f}%\n"
-            f"وین ریت {t['win_n']}/{t['win_total']} سفارش: {t['win_rate']*100:.1f}%\n"
+            f"وین ریت {t['win_n']}/{t['win_total']} سفارش: {t['win_rate']*100:.1f}% (فقط نمایشی)\n"
             f"ارز البانک: {t['ok']}/{t['total']} ({t['share']*100:.0f}%){diversity_warn}\n"
             f"حداکثر افت: {t['drawdown']*100:.1f}% | پایداری: {t['stability']:.2f}\n"
             f"ماه‌ها: {months_txt}\n"
@@ -445,6 +441,7 @@ def main():
             reject_reasons["no_fills"] += 1
             continue
 
+        # وین‌ریت — فقط برای نمایش
         wr, wr_used, wr_closed = win_rate_by_oid(fills)
         share, ok, total_coins = lbank_share_from_fills(fills, lbank)
 
@@ -479,8 +476,9 @@ def main():
         drawdown  = compute_drawdown(rois)
         stability = compute_stability(rois)
 
+        # ⚠️ وین‌ریت ورودی امتیاز نیست
         score = compute_score(
-            wr, wr_used, avg_roi, min_roi, months, share, total_coins
+            avg_roi, min_roi, months, share, total_coins
         )
 
         scored.append({
