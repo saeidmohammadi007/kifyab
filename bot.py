@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-اسکنر لیدربورد Hyperliquid — نسخه امتیازدهی (وزن‌های مساوی)
-هر معیار 20 امتیاز | مجموع 100
+اسکنر لیدربورد Hyperliquid — نسخه اصلاح‌شده (v2)
+- گیت سابقه (حداقل ۴ ماه)
+- گیت معاملات بسته (حداقل ۴۰ در ۶ ماه)
+- گیت بلواپ (حذف ماه بدتر از -۲۰٪)
+- میانگین هندسی ROI به‌جای حسابی
+- ضریب اعتماد وین‌ریت بر اساس تعداد معاملات
+- شرط حداقل تنوع ارز برای معیار البانک
+- ضریب سابقه نهایی
+- نمایش Max Drawdown و پایداری در خروجی
 """
 import os
 import sys
 import time
 import bisect
 import json
+import math
 import datetime as dt
 import requests
 import ccxt
@@ -20,21 +28,30 @@ W_LBANK    = 20
 W_MONTHS   = 20
 W_WIN_RATE = 20
 
-# ---------------- تنظیمات ----------------
-MIN_ACCOUNT_VALUE = 50
-AVG_MONTHS = 6
-WIN_RATE_TRADES = 100
-MIN_BASE = 50
-MAX_CANDIDATES = None
-TOP_N = 100
-DELAY = 0.25
-TOP_PER_CHUNK = 800
+# ---------------- گیت‌ها و آستانه‌ها ----------------
+MIN_ACCOUNT_VALUE   = 50
+AVG_MONTHS          = 6
+WIN_RATE_TRADES     = 100
+
+MIN_MONTHS_REQUIRED = 4       # گیت سابقه
+MIN_CLOSED_TRADES   = 40      # گیت معاملات بسته در ۶ ماه
+MIN_TRADES_WIN_RATE = 30      # حداقل معاملات برای معیار وین‌ریت
+MIN_COINS_FOR_LBANK = 3       # حداقل تنوع ارز برای معیار البانک
+BLOWUP_THRESHOLD    = -0.20   # ماه بدتر از این → حذف
+
+MIN_BASE            = 50
+MAX_CANDIDATES      = None
+TOP_N               = 100
+DELAY               = 0.25
+TOP_PER_CHUNK       = 800
+
+HISTORY_FULL_MONTHS = 6       # ضریب سابقه در ۶ ماه = ۱.۰
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
-LB_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+LB_URL   = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
+TG_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 CHUNK_INDEX = int(os.environ.get("CHUNK_INDEX", "0"))
 CHUNK_TOTAL = int(os.environ.get("CHUNK_TOTAL", "1"))
@@ -43,7 +60,7 @@ if os.environ.get("TOP_N"):
     TOP_N = int(os.environ["TOP_N"])
 
 S = requests.Session()
-S.headers.update({"User-Agent": "hl-scanner/1.0"})
+S.headers.update({"User-Agent": "hl-scanner/2.0"})
 
 
 def log(*a):
@@ -160,7 +177,7 @@ def monthly_rois(addr, now):
     if not p:
         return []
     pnl = [(int(t), float(v)) for t, v in p.get("pnlHistory", [])]
-    av = [(int(t), float(v)) for t, v in p.get("accountValueHistory", [])]
+    av  = [(int(t), float(v)) for t, v in p.get("accountValueHistory", [])]
     if len(pnl) < 2 or len(av) < 2:
         return []
     pnl.sort()
@@ -201,15 +218,21 @@ def get_fills_6mo(addr, now):
 
 
 def win_rate_from_fills(fills):
+    """
+    برمی‌گرداند: (win_rate, n_used, n_closed_total)
+      - win_rate روی WIN_RATE_TRADES معامله آخر
+      - n_used = تعداد معاملات بسته‌ای که در محاسبه وین‌ریت استفاده شد
+      - n_closed_total = کل معاملات بسته در ۶ ماه (برای گیت)
+    """
     closed = [f for f in fills if abs(float(f.get("closedPnl", 0) or 0)) > 0]
     if not closed:
-        return None, 0
+        return None, 0, 0
     closed.sort(key=lambda f: int(f["time"]))
-    if len(closed) > WIN_RATE_TRADES:
-        closed = closed[-WIN_RATE_TRADES:]
-    total = len(closed)
-    wins = sum(1 for f in closed if float(f["closedPnl"]) > 0)
-    return wins / total, total
+    total_closed = len(closed)
+    used = closed[-WIN_RATE_TRADES:] if len(closed) > WIN_RATE_TRADES else closed
+    n = len(used)
+    wins = sum(1 for f in used if float(f["closedPnl"]) > 0)
+    return wins / n, n, total_closed
 
 
 def lbank_share_from_fills(fills, lbank):
@@ -220,71 +243,149 @@ def lbank_share_from_fills(fills, lbank):
     return ok / len(coins), ok, len(coins)
 
 
-# ---------------- امتیازدهی (هر معیار 0..20) ----------------
+# ---------------- متریک‌های اضافی ----------------
+def geo_mean_roi(rois_pairs):
+    """
+    میانگین هندسی بازدهی ماهانه — برای داده‌های پرنوسان دقیق‌تر از حسابی.
+    هر ماهی که -۱۰۰٪ یا بدتر باشد، 0.01 در نظر گرفته می‌شود (fallback).
+    """
+    vals = [r for _, r in rois_pairs]
+    if not vals:
+        return 0.0
+    logs = [math.log(max(1 + r, 0.01)) for r in vals]
+    return math.exp(sum(logs) / len(logs)) - 1.0
+
+
+def compute_drawdown(rois_pairs):
+    """حداکثر افت سرمایه از پیک (compounded monthly)."""
+    if not rois_pairs:
+        return 0.0
+    equity, peak, max_dd = 1.0, 1.0, 0.0
+    for _, r in rois_pairs:
+        equity *= (1 + r)
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            dd = (peak - equity) / peak
+            if dd > max_dd:
+                max_dd = dd
+    return max_dd
+
+
+def compute_stability(rois_pairs):
+    """نسبت میانگین به انحراف معیار بازدهی ماهانه (شبه-شارپ)."""
+    vals = [r for _, r in rois_pairs]
+    if len(vals) < 2:
+        return 0.0
+    mean = sum(vals) / len(vals)
+    var  = sum((v - mean) ** 2 for v in vals) / len(vals)
+    std  = var ** 0.5
+    if std < 1e-9:
+        return 0.0
+    return mean / std
+
+
+# ---------------- امتیازدهی ----------------
 def score_min_month(r):
-    """کمترین ماه: -5%→0 | 0%→8 | +5%→17 | +10%+→20"""
-    if r >= 0.10:  return W_MIN_MO
-    if r <= -0.05: return 0.0
-    if r < 0:      return (r + 0.05) / 0.05 * 8
-    if r < 0.05:   return 8 + (r / 0.05) * (17 - 8)
-    return 17 + ((r - 0.05) / 0.05) * (20 - 17)
+    """
+    -20% یا بدتر → -25 (جریمه، در عمل گیت بلواپ زودتر حذف می‌کند)
+    -10% → 0
+     0%  → 8
+    +5%  → 17
+    +10%+ → 20
+    """
+    if r <= -0.20:  return -25.0
+    if r <= -0.10:  return -15 + (r + 0.20) * 150        # -15 → 0
+    if r <  0:      return (r + 0.10) / 0.10 * 8         # 0 → 8
+    if r <  0.05:   return 8 + (r / 0.05) * 9            # 8 → 17
+    if r <  0.10:   return 17 + ((r - 0.05) / 0.05) * 3  # 17 → 20
+    return float(W_MIN_MO)
 
 
 def score_avg_roi(r):
-    """میانگین ۶ ماه: 0%→0 | 20%+→20"""
+    """میانگین هندسی ۶ ماه: 0%→0 | 20%+→20."""
     if r is None or r <= 0: return 0.0
-    if r >= 0.20:           return W_AVG_ROI
+    if r >= 0.20:           return float(W_AVG_ROI)
     return (r / 0.20) * W_AVG_ROI
 
 
-def score_lbank(share):
-    """سهم البانک: <50%→0 | 90%+→20"""
-    if share >= 0.90: return W_LBANK
+def score_lbank(share, n_coins):
+    """سهم البانک با شرط حداقل تنوع ارز."""
+    if n_coins < MIN_COINS_FOR_LBANK:
+        return 0.0
+    if share >= 0.90: return float(W_LBANK)
     if share <= 0.50: return 0.0
     return (share - 0.50) / 0.40 * W_LBANK
 
 
 def score_months(m):
-    """سابقه: <3 ماه→0 | 6+ ماه→20"""
-    if m >= 6: return W_MONTHS
-    if m <= 3: return 0.0
-    return (m - 3) / 3 * W_MONTHS
+    """سابقه: <4 ماه→0 | 6+ ماه→20."""
+    if m >= 6: return float(W_MONTHS)
+    if m <= 4: return 0.0
+    return (m - 4) / 2.0 * W_MONTHS
 
 
-def score_win_rate(wr):
-    """وین ریت: <30%→0 | 100%→20"""
-    if wr is None or wr <= 0.30: return 0.0
-    if wr >= 1.0:                return W_WIN_RATE
-    return (wr - 0.30) / 0.70 * W_WIN_RATE
+def score_win_rate(wr, n_used):
+    """وین‌ریت با ضریب اعتماد بر اساس تعداد معاملات."""
+    if n_used < MIN_TRADES_WIN_RATE:
+        return 0.0
+    if wr is None or wr <= 0.30:
+        return 0.0
+    base = W_WIN_RATE if wr >= 1.0 else (wr - 0.30) / 0.70 * W_WIN_RATE
+    confidence = 0.3 + 0.7 * min(n_used / WIN_RATE_TRADES, 1.0)
+    return base * confidence
 
 
-def compute_score(wr, avg_roi, min_roi, months, share):
-    return (
+def history_factor(months):
+    """ضریب سابقه: 0 در 0 ماه، 1 در 6+ ماه."""
+    return min(months / HISTORY_FULL_MONTHS, 1.0)
+
+
+def compute_score(wr, wr_n, avg_roi, min_roi, months, share, n_coins):
+    components = (
         score_min_month(min_roi) +
         score_avg_roi(avg_roi) +
-        score_lbank(share) +
+        score_lbank(share, n_coins) +
         score_months(months) +
-        score_win_rate(wr)
+        score_win_rate(wr, wr_n)
     )
+    hf = history_factor(months)
+    # امتیاز مثبت با ضریب سابقه کاهش می‌یابد، ولی جریمه‌ها کاهش نمی‌یابند
+    if components > 0:
+        return components * hf
+    return components
 
 
 # ---------------- ارسال نتایج ----------------
-def send_results(passed, now):
+def send_results(passed, stats, now):
     if not passed:
-        tg_send("🔎 اسکن Hyperliquid تمام شد؛ هیچ تریدری امتیاز نگرفت.")
+        tg_send(
+            "🔎 اسکن Hyperliquid تمام شد.\n"
+            f"کاندید: {stats['cands']}\n"
+            f"رد در گیت: {stats['rejected']}\n"
+            f"امتیازگرفته: 0\n"
+        )
         return
-    head = (f"🏆 نتایج اسکن Hyperliquid ({now:%Y-%m-%d})\n"
-            f"تعداد کل امتیازگرفته: {len(passed)}\n"
-            f"نمایش {min(TOP_N, len(passed))} نتیجه برتر\n")
+
+    head = (
+        f"🏆 نتایج اسکن Hyperliquid ({now:%Y-%m-%d})\n"
+        f"کاندید: {stats['cands']} | رد در گیت: {stats['rejected']} | "
+        f"امتیازگرفته: {stats['scored']}\n"
+        f"نمایش {min(TOP_N, len(passed))} نتیجه برتر\n"
+    )
     lines = [head]
     for n, t in enumerate(passed[:TOP_N], 1):
         months_txt = " | ".join(f"{m[5:]}: {x*100:.0f}%" for m, x in t["last"]) or "—"
+        diversity_warn = " ⚠️ کم‌تنوع" if t["total"] < MIN_COINS_FOR_LBANK else ""
         lines.append(
-            f"{n}) <b>امتیاز: {t['score']:.1f}</b> | میانگین ۶ ماه: {t['avg']*100:.1f}%\n"
+            f"{n}) <b>امتیاز: {t['score']:.1f}</b> | "
+            f"میانگین ۶ ماه (هندسی): {t['avg']*100:.1f}%\n"
             f"<code>{t['addr']}</code>\n"
-            f"سابقه: {t['months']} ماه | کمترین ماه: {t['min']*100:.1f}%\n"
-            f"وین ریت {t['win_n']} معامله اخیر: {t['win_rate']*100:.1f}%\n"
-            f"ارز البانک: {t['ok']}/{t['total']} ({t['share']*100:.0f}%)\n"
+            f"سابقه: {t['months']} ماه (ضریب {t['hist_factor']:.2f}) | "
+            f"کمترین ماه: {t['min']*100:.1f}%\n"
+            f"وین ریت {t['win_n']}/{t['win_total']} معامله: {t['win_rate']*100:.1f}%\n"
+            f"ارز البانک: {t['ok']}/{t['total']} ({t['share']*100:.0f}%){diversity_warn}\n"
+            f"حداکثر افت: {t['drawdown']*100:.1f}% | پایداری: {t['stability']:.2f}\n"
             f"ماه‌ها: {months_txt}\n"
         )
     tg_send("\n".join(lines))
@@ -318,49 +419,88 @@ def main():
         log(f"کاندیدا برای بررسی: {len(cands)}")
 
     scored = []
+    rejected = 0
+    reject_reasons = {
+        "no_fills": 0,
+        "few_trades": 0,
+        "no_rois": 0,
+        "few_months": 0,
+        "blowup": 0,
+    }
+
     for i, addr in enumerate(cands, 1):
         if i % 100 == 0:
-            log(f"  بررسی {i}/{len(cands)} | امتیازگرفته: {len(scored)}")
+            log(f"  بررسی {i}/{len(cands)} | "
+                f"امتیازگرفته: {len(scored)} | رد: {rejected}")
 
         fills = get_fills_6mo(addr, now)
         if not fills:
+            rejected += 1
+            reject_reasons["no_fills"] += 1
             continue
 
-        wr, wr_n = win_rate_from_fills(fills)
+        wr, wr_used, wr_closed = win_rate_from_fills(fills)
         share, ok, total_coins = lbank_share_from_fills(fills, lbank)
 
-        rois = monthly_rois(addr, now)
-        if rois:
-            last = [x for _, x in rois[-AVG_MONTHS:]]
-            avg_roi = sum(last) / len(last)
-            min_roi = min(x for _, x in rois)
-            months = len(rois)
-            last_months = rois[-AVG_MONTHS:]
-        else:
-            avg_roi = 0.0
-            min_roi = 0.0
-            months = 0
-            last_months = []
+        # گیت معاملات
+        if wr_closed < MIN_CLOSED_TRADES:
+            rejected += 1
+            reject_reasons["few_trades"] += 1
+            continue
 
-        score = compute_score(wr, avg_roi, min_roi, months, share)
+        rois = monthly_rois(addr, now)
+        if not rois:
+            rejected += 1
+            reject_reasons["no_rois"] += 1
+            continue
+
+        months = len(rois)
+
+        # گیت سابقه
+        if months < MIN_MONTHS_REQUIRED:
+            rejected += 1
+            reject_reasons["few_months"] += 1
+            continue
+
+        min_roi = min(x for _, x in rois)
+
+        # گیت بلواپ
+        if min_roi < BLOWUP_THRESHOLD:
+            rejected += 1
+            reject_reasons["blowup"] += 1
+            continue
+
+        last_months = rois[-AVG_MONTHS:]
+        avg_roi   = geo_mean_roi(last_months)      # میانگین هندسی
+        drawdown  = compute_drawdown(rois)
+        stability = compute_stability(rois)
+
+        score = compute_score(
+            wr, wr_used, avg_roi, min_roi, months, share, total_coins
+        )
 
         scored.append({
             "addr": addr,
             "score": round(score, 2),
             "win_rate": wr if wr is not None else 0.0,
-            "win_n": wr_n,
+            "win_n": wr_used,
+            "win_total": wr_closed,
             "avg": avg_roi,
             "min": min_roi,
             "months": months,
+            "hist_factor": history_factor(months),
             "share": share,
             "ok": ok,
             "total": total_coins,
+            "drawdown": drawdown,
+            "stability": stability,
             "last": last_months,
         })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[:TOP_PER_CHUNK]
-    log(f"امتیاز گرفته: {len(scored)} | ذخیره top {len(top)}")
+    log(f"امتیاز گرفته: {len(scored)} | ذخیره top {len(top)} | رد در گیت: {rejected}")
+    log(f"دلایل رد: {reject_reasons}")
 
     out_file = f"results_{CHUNK_INDEX}.json"
     with open(out_file, "w", encoding="utf-8") as f:
@@ -368,7 +508,12 @@ def main():
     log(f"ذخیره شد: {out_file}")
 
     if CHUNK_TOTAL == 1:
-        send_results(scored, now)
+        stats = {
+            "cands": len(cands),
+            "rejected": rejected,
+            "scored": len(scored),
+        }
+        send_results(scored, stats, now)
 
 
 if __name__ == "__main__":
